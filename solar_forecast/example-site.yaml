@@ -1,0 +1,58 @@
+schema_version: 1
+
+site:
+  id: "my_solar_site"
+  name: "My solar site"
+  latitude: 59.91
+  longitude: 10.75
+  timezone: "Europe/Oslo"
+  country_code: "NO"
+
+weather:
+  provider: "met_no_locationforecast"
+  provider_url: "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+  user_agent: "MySolarSite/1.0 (replace-with-your-contact)"
+
+model:
+  mode: "physical_plane_of_array"
+  base_performance_ratio: 0.82
+  albedo: 0.20
+  temperature_correction_enabled: true
+  temperature_coefficient_per_c: -0.004
+  nominal_operating_cell_temperature_c: 45
+  uncertainty_percent: 15
+
+  # Only documentation/fallback values. They are not multiplied into the
+  # physical calculation, which already uses tilt, azimuth and solar position.
+  fallback_orientation_factors:
+    south: 0.90
+    east: 0.75
+    west: 0.75
+    north:
+      factor: 0.50
+      maximum_tilt_deg: 22
+    vertical_fence: 0.50
+
+# Azimuth convention: 0 north, 90 east, 180 south, 270 west.
+arrays:
+  - id: "south_roof"
+    description: "Example roof"
+    module_count: 20
+    module_power_wp: 430
+    capacity_kwp: 8.60
+    tilt_deg: 30
+    azimuth_deg: 180
+    orientation: "south"
+
+measurements:
+  solar_energy:
+    aggregation: "sum"
+    statistic_entities: []
+  battery_soc_entity: null
+
+output:
+  entity_prefix: "solar_forecast"
+  include_hourly: true
+  include_daily: true
+  include_by_direction: true
+

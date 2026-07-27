@@ -1,0 +1,39 @@
+name: Local Solar Forecast
+version: "0.2.0"
+slug: solar_forecast
+description: Generic, local solar forecast with immutable forecast history
+url: https://github.com/hovbjo99/local-solar-forecast
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:solar-power-variant
+panel_title: Solar forecast
+watchdog: http://[HOST]:[PORT:8099]/health
+ports:
+  8099/tcp: null
+ports_description:
+  8099/tcp: Optional direct HTTP API; leave disabled when only other HA apps use it
+map:
+  - type: homeassistant_config
+    read_only: true
+    path: /config
+options:
+  site_config_path: /config/solar_forecast/site.yaml
+  refresh_minutes: 30
+  history_days: 730
+  listen_port: 8099
+  log_level: info
+  legacy_history_path: /config/solar_forecast/legacy-forecast-snapshots.ndjson
+schema:
+  site_config_path: str
+  refresh_minutes: int(5,360)
+  history_days: int(30,3650)
+  listen_port: port
+  log_level: list(debug|info|warning|error)
+  legacy_history_path: str

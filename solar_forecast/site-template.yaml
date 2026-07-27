@@ -1,0 +1,174 @@
+# Generic PV site template for Local Solar Forecast.
+#
+# Copy to:
+#   /config/solar_forecast/site.yaml
+#
+# Replace every REPLACE_ME value. Add one arrays entry for each distinct roof,
+# facade, fence or inverter/string group. Groups with different direction,
+# tilt, module type or measured production should remain separate.
+
+schema_version: 1
+
+site:
+  id: "REPLACE_ME"
+  name: "REPLACE_ME"
+  latitude: 0.0
+  longitude: 0.0
+  elevation_m: null
+  timezone: "Europe/Oslo"
+  country_code: "NO"
+
+weather:
+  provider: "met_no_locationforecast"
+  provider_url: "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+  user_agent: "REPLACE_ME/1.0 (REPLACE_WITH_CONTACT_OR_WEB_ADDRESS)"
+
+model:
+  mode: "physical_plane_of_array"
+  base_performance_ratio: 0.82
+  albedo: 0.20
+  minimum_solar_elevation_deg: 0.0
+  temperature_correction_enabled: true
+  temperature_coefficient_per_c: -0.004
+  nominal_operating_cell_temperature_c: 45
+  uncertainty_percent: 15
+
+  solar_geometry:
+    calculate_elevation_from_site_geodata: true
+    calculate_azimuth_from_site_geodata: true
+    apply_incidence_per_array_from_tilt_and_azimuth: true
+    hardcoded_peak_time: null
+
+  # These are documented fallback assumptions, not panel efficiency.
+  # The physical model already uses geodata, solar position, tilt and azimuth,
+  # so these factors are not multiplied into the normal calculation.
+  fallback_orientation_factors:
+    explanation: >-
+      Simplified fallback: south 0.90, east and west 0.75, and north
+      0.50 for roof tilt up to 22 degrees. Vertical fields use 0.50.
+    south: 0.90
+    east: 0.75
+    west: 0.75
+    north:
+      factor: 0.50
+      maximum_tilt_deg: 22
+    vertical_fence: 0.50
+
+# AZIMUTH CONVENTION
+#   0° = north
+#  90° = east
+# 180° = south
+# 270° = west
+#
+# TILT CONVENTION
+#   0° = horizontal
+#  90° = vertical wall/fence
+#
+# Keep capacity_kwp equal to:
+#   module_count × module_power_wp / 1000
+#
+# The active example below deliberately contains REPLACE_ME values. Duplicate
+# it once for every real panel group and use any unique id.
+arrays:
+  - id: "REPLACE_ME_ARRAY_ID"
+    description: "REPLACE_ME"
+    module_count: REPLACE_ME
+    module_power_wp: REPLACE_ME
+    capacity_kwp: REPLACE_ME
+    tilt_deg: REPLACE_ME
+    azimuth_deg: REPLACE_ME
+    orientation: "REPLACE_ME"
+    actual_power_entity: null
+    actual_energy_entity: null
+
+# Copy additional groups from these patterns as needed:
+#
+# SOUTH-FACING ROOF
+# - id: "south_roof_01"
+#   description: "South-facing roof"
+#   module_count: 20
+#   module_power_wp: 430
+#   capacity_kwp: 8.600
+#   tilt_deg: 30
+#   azimuth_deg: 180
+#   orientation: "south"
+#
+# EAST-FACING ROOF
+# - id: "east_roof_01"
+#   description: "East-facing roof"
+#   module_count: 20
+#   module_power_wp: 430
+#   capacity_kwp: 8.600
+#   tilt_deg: 30
+#   azimuth_deg: 90
+#   orientation: "east"
+#
+# WEST-FACING ROOF
+# - id: "west_roof_01"
+#   description: "West-facing roof"
+#   module_count: 20
+#   module_power_wp: 430
+#   capacity_kwp: 8.600
+#   tilt_deg: 30
+#   azimuth_deg: 270
+#   orientation: "west"
+#
+# NORTH-FACING LOW-PITCH ROOF
+# - id: "north_roof_01"
+#   description: "North-facing low-pitch roof"
+#   module_count: 20
+#   module_power_wp: 430
+#   capacity_kwp: 8.600
+#   tilt_deg: 20
+#   azimuth_deg: 0
+#   orientation: "north"
+#
+# VERTICAL EAST-FACING FENCE OR FACADE
+# - id: "east_vertical_01"
+#   description: "Vertical east-facing field"
+#   module_count: 10
+#   module_power_wp: 450
+#   capacity_kwp: 4.500
+#   tilt_deg: 90
+#   azimuth_deg: 90
+#   orientation: "east"
+
+measurements:
+  # These fields prepare the same file for later empirical calibration.
+  # The forecast itself works when the entity lists are empty.
+  solar_energy:
+    aggregation: "sum"
+    # Long-term-statistics entities. Completed days are read automatically
+    # from Home Assistant Recorder and stored as immutable observations.
+    statistic_entities: []
+    current_day_entities: []
+  solar_power:
+    aggregation: "sum"
+    entities: []
+  outdoor_temperature_entity: null
+
+calibration:
+  enabled: true
+  minimum_training_days: 30
+  rolling_window_days: 90
+  separate_by:
+    - "array"
+    - "month"
+    - "hour"
+    - "weather_class"
+    - "forecast_horizon"
+  metrics:
+    - "wmape"
+    - "bias"
+    - "mae_kwh"
+
+output:
+  entity_prefix: "solar_forecast"
+  include_hourly: true
+  include_daily: true
+  include_by_direction: true
+  include_by_array: true
+  include_uncertainty_bands:
+    - "p10"
+    - "p50"
+    - "p90"
