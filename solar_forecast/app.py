@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ except ModuleNotFoundError:  # Allows JSON-only local tests without PyYAML.
 
 from forecast_engine import MODEL_VERSION, build_forecast, validate_site_config
 from history_store import ForecastHistory
+from calibration import apply_calibration, fit_calibration
 
 
 UTC = timezone.utc
@@ -31,6 +33,7 @@ DEFAULT_OPTIONS = {
     "site_config_path": "/config/solar_forecast/site.yaml",
     "refresh_minutes": 30,
     "history_days": 730,
+    "hourly_empirical_lookback_days": 90,
     "listen_port": 8099,
     "log_level": "info",
     "legacy_history_path": (
@@ -97,7 +100,47 @@ class ServiceState:
                 "provider": "met_no_locationforecast",
                 "source": source,
             }
-            run_id, inserted = self.history.append(forecast)
+            model_run_at = (
+                ((payload.get("properties") or {}).get("meta") or {}).get(
+                    "updated_at"
+                )
+            )
+            forecast["forecast_summary"]["model_run_at"] = model_run_at
+            forecast["forecast_summary"][
+                "issued_at_semantics"
+            ] = "forecast_generated_at_after_retrieval"
+            forecast["forecast_summary"]["source"] = "met_no_locationforecast"
+            calibration_options = self.config.get("calibration") or {}
+            calibration = (
+                self.history.active_calibration(self.config["site"]["id"])
+                if calibration_options.get("enabled", True)
+                else None
+            )
+            apply_calibration(forecast, calibration)
+            run_id, inserted = self.history.append(
+                forecast,
+                raw_source={
+                    "provider": "met_no_locationforecast",
+                    "model": "locationforecast_compact",
+                    "model_run_at": model_run_at,
+                    "retrieved_at": _iso(now),
+                    "request": {
+                        "endpoint": (
+                            (self.config.get("weather") or {}).get(
+                                "provider_url"
+                            )
+                            or (
+                                "https://api.met.no/weatherapi/"
+                                "locationforecast/2.0/compact"
+                            )
+                        ),
+                        "latitude": self.config["site"]["latitude"],
+                        "longitude": self.config["site"]["longitude"],
+                        "cache_status": source,
+                    },
+                    "payload": payload,
+                },
+            )
             forecast["snapshot_storage"] = {
                 "run_id": run_id,
                 "inserted": inserted,
@@ -108,8 +151,39 @@ class ServiceState:
                     "fallback latest before target midnight"
                 ),
             }
-            self.history.prune(self.options["history_days"])
             self.refresh_actuals()
+            self.refresh_hourly_actuals()
+            learned = (
+                fit_calibration(
+                    self.history,
+                    self.config["site"]["id"],
+                    self.config["site"]["timezone"],
+                    minimum_samples=calibration_options.get(
+                        "minimum_training_hours", 48
+                    ),
+                    factor_min=calibration_options.get("factor_min", 0.70),
+                    factor_max=calibration_options.get("factor_max", 1.30),
+                    minimum_mae_improvement_percent=calibration_options.get(
+                        "minimum_mae_improvement_percent", 2
+                    ),
+                )
+                if calibration_options.get("enabled", True)
+                else None
+            )
+            if learned:
+                calibration_id, calibration_inserted = (
+                    self.history.append_calibration(learned)
+                )
+                LOG.info(
+                    "Calibration evaluated: id=%s accepted=%s inserted=%s "
+                    "samples=%s mae_before=%s mae_after=%s",
+                    calibration_id[:12],
+                    learned["accepted"],
+                    calibration_inserted,
+                    learned["sample_count"],
+                    learned["mae_before_kwh"],
+                    learned["mae_after_kwh"],
+                )
             with self.lock:
                 self.forecast = forecast
                 self.last_error = None
@@ -207,6 +281,193 @@ class ServiceState:
             self.last_empirical_error = str(exc)
             LOG.warning("Empirical production refresh failed: %s", exc)
 
+    def refresh_hourly_actuals(self):
+        """Capture hourly PV energy and outdoor temperature from HA Recorder."""
+        measurements = self.config.get("measurements") or {}
+        solar_ids = (
+            (measurements.get("solar_energy") or {}).get(
+                "statistic_entities", []
+            )
+            or (measurements.get("solar_energy") or {}).get("entities", [])
+        )
+        temperature_id = measurements.get(
+            "outdoor_temperature_statistic_entity"
+        )
+        statistic_ids = list(solar_ids)
+        if temperature_id:
+            statistic_ids.append(temperature_id)
+        if not statistic_ids:
+            return
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            return
+        now = datetime.now(UTC)
+        lookback = max(
+            2,
+            min(
+                int(self.options.get("hourly_empirical_lookback_days", 90)),
+                int(self.options["history_days"]),
+            ),
+        )
+        payload = {
+            "statistic_ids": statistic_ids,
+            "start_time": _iso(now - timedelta(days=lookback)),
+            "end_time": _iso(now),
+            "period": "hour",
+            "types": ["change", "mean"],
+            "units": {},
+        }
+        request = urllib.request.Request(
+            (
+                "http://supervisor/core/api/services/"
+                "recorder/get_statistics?return_response"
+            ),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response_payload = json.load(response)
+            statistics = _find_statistics(response_payload, statistic_ids)
+            by_time = {}
+            for entity_id in solar_ids:
+                for point in statistics.get(entity_id, []):
+                    try:
+                        target_time = _iso(
+                            datetime.fromisoformat(
+                                str(point["start"]).replace("Z", "+00:00")
+                            )
+                        )
+                        change = max(0.0, float(point["change"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if _parse_utc(target_time) + timedelta(hours=1) > now:
+                        continue
+                    item = by_time.setdefault(
+                        target_time,
+                        {"pv_kwh": 0.0, "temperature_c": None, "entities": {}},
+                    )
+                    item["pv_kwh"] += change
+                    item["entities"][entity_id] = change
+            if temperature_id:
+                for point in statistics.get(temperature_id, []):
+                    try:
+                        target_time = _iso(
+                            datetime.fromisoformat(
+                                str(point["start"]).replace("Z", "+00:00")
+                            )
+                        )
+                        temperature = float(point["mean"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    item = by_time.setdefault(
+                        target_time,
+                        {"pv_kwh": None, "temperature_c": None, "entities": {}},
+                    )
+                    item["temperature_c"] = temperature
+            observed_at = _iso(now)
+            for target_time, item in by_time.items():
+                self.history.append_hourly_actual(
+                    self.config["site"]["id"],
+                    target_time,
+                    actual_pv_kwh=item["pv_kwh"],
+                    actual_temperature_c=item["temperature_c"],
+                    source="home_assistant_recorder_hourly_statistics",
+                    details={"solar_entities_kwh": item["entities"]},
+                    observed_at=observed_at,
+                )
+            LOG.info("Hourly empirical observations updated: hours=%s", len(by_time))
+        except Exception as exc:
+            self.last_empirical_error = str(exc)
+            LOG.warning("Hourly empirical refresh failed: %s", exc)
+
+    def import_empirics(self, payload):
+        """Append externally measured daily/hourly production observations."""
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        configured_site_id = str(self.config["site"]["id"])
+        site_id = str(payload.get("site_id") or configured_site_id)
+        if site_id != configured_site_id:
+            raise ValueError("site_id does not match the configured site")
+        source = str(payload.get("source") or "").strip()
+        if not source:
+            raise ValueError("source is required")
+        observed_at = payload.get("observed_at") or _iso(datetime.now(UTC))
+        _parse_utc(str(observed_at))
+        daily = payload.get("daily") or []
+        hourly = payload.get("hourly") or []
+        if not isinstance(daily, list) or not isinstance(hourly, list):
+            raise ValueError("daily and hourly must be arrays")
+        if not daily and not hourly:
+            raise ValueError("at least one daily or hourly observation is required")
+        if len(daily) > 3660 or len(hourly) > 20000:
+            raise ValueError("empirical import is too large")
+
+        result = {
+            "site_id": site_id,
+            "source": source,
+            "observed_at": str(observed_at),
+            "daily_received": len(daily),
+            "daily_inserted": 0,
+            "hourly_received": len(hourly),
+            "hourly_inserted": 0,
+            "append_only": True,
+        }
+        for item in daily:
+            if not isinstance(item, dict):
+                raise ValueError("each daily observation must be an object")
+            target_date = str(item.get("target_date") or "")
+            try:
+                datetime.strptime(target_date, "%Y-%m-%d")
+                actual = float(item["actual_kwh_total"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid daily observation") from exc
+            if not math.isfinite(actual) or actual < 0:
+                raise ValueError(
+                    "daily actual_kwh_total must be finite and non-negative"
+                )
+            _, inserted = self.history.append_actual(
+                site_id,
+                target_date,
+                actual,
+                source,
+                details=item.get("details") or {},
+                observed_at=str(observed_at),
+            )
+            result["daily_inserted"] += int(inserted)
+
+        for item in hourly:
+            if not isinstance(item, dict):
+                raise ValueError("each hourly observation must be an object")
+            target_time = str(item.get("target_time") or "")
+            pv = item.get("actual_pv_kwh")
+            temperature = item.get("actual_temperature_c")
+            if pv is not None:
+                pv = float(pv)
+                if not math.isfinite(pv) or pv < 0:
+                    raise ValueError(
+                        "hourly actual_pv_kwh must be finite and non-negative"
+                    )
+            if temperature is not None:
+                temperature = float(temperature)
+                if not math.isfinite(temperature):
+                    raise ValueError("hourly temperature must be finite")
+            _, inserted = self.history.append_hourly_actual(
+                site_id,
+                target_time,
+                actual_pv_kwh=pv,
+                actual_temperature_c=temperature,
+                source=source,
+                details=item.get("details") or {},
+                observed_at=str(observed_at),
+            )
+            result["hourly_inserted"] += int(inserted)
+        return result
+
     def _fetch_weather(self):
         site = self.config["site"]
         weather = self.config.get("weather") or {}
@@ -258,6 +519,9 @@ class ServiceState:
                 "last_empirical_success_at": self.last_empirical_success_at,
                 "last_empirical_error": self.last_empirical_error,
                 "legacy_import": self.legacy_import,
+                "active_calibration": self.history.active_calibration(
+                    self.config["site"]["id"]
+                ),
             }
 
     def current_forecast(self):
@@ -343,6 +607,31 @@ class RequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if path == "/api/hourly-comparison":
+            site_id = _first(
+                query, "site_id", self.server.state.config["site"]["id"]
+            )
+            target_date = _first(query, "target_date")
+            if not target_date:
+                self._json(
+                    {
+                        "error": "target_date_required",
+                        "example": "/api/hourly-comparison?target_date=2026-07-17",
+                    },
+                    400,
+                )
+                return
+            try:
+                result = self.server.state.history.hourly_comparisons(
+                    site_id,
+                    target_date,
+                    self.server.state.config["site"]["timezone"],
+                )
+            except ValueError:
+                self._json({"error": "invalid_target_date"}, 400)
+                return
+            self._json(result)
+            return
         self._json({"error": "not_found", "path": path}, 404)
 
     def do_POST(self):
@@ -354,6 +643,24 @@ class RequestHandler(BaseHTTPRequestHandler):
                 daemon=True,
             ).start()
             self._json({"accepted": True}, 202)
+            return
+        if path == "/api/empirics/import":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 5 * 1024 * 1024:
+                    raise ValueError("invalid Content-Length")
+                payload = json.loads(self.rfile.read(length))
+                result = self.server.state.import_empirics(payload)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                self._json(
+                    {
+                        "error": "invalid_empirical_import",
+                        "message": str(exc),
+                    },
+                    400,
+                )
+                return
+            self._json(result, 201)
             return
         self._json({"error": "not_found", "path": path}, 404)
 
@@ -410,6 +717,15 @@ def _dashboard_html(state):
     metrics = state.history.empirical_metrics(
         state.config["site"]["id"], state.config["site"]["timezone"], 730
     )
+    hourly_result = (
+        state.history.hourly_comparisons(
+            state.config["site"]["id"],
+            comparisons[0]["target_date"],
+            state.config["site"]["timezone"],
+        )
+        if comparisons
+        else {"hours": [], "target_date": None}
+    )
     rows = "".join(
         (
             f"<tr><td>{item['target_date']}</td>"
@@ -431,6 +747,20 @@ def _dashboard_html(state):
             f"<td>{_escape(item['forecast_issued_at'] or '–')}</td></tr>"
         )
         for item in comparisons
+    )
+    hourly_rows = "".join(
+        (
+            f"<tr><td>{_escape(item['target_time'])}</td>"
+            f"<td>{_number(item['forecast_kwh'])}</td>"
+            f"<td>{_number(item['actual_kwh'])}</td>"
+            f"<td>{_signed_number(item['deviation_kwh'])}</td>"
+            f"<td>{_number(item['cloud_cover_total_percent'])}</td>"
+            f"<td>{_number(item['forecast_temperature_c'])}</td>"
+            f"<td>{_number(item['actual_temperature_c'])}</td>"
+            f"<td>{_number(item['lead_hours'])}</td>"
+            f"<td>{_escape(item['source'])}</td></tr>"
+        )
+        for item in hourly_result["hours"]
     )
     error = (
         f"<p class='error'>{_escape(status['last_error'])}</p>"
@@ -485,9 +815,19 @@ def _dashboard_html(state):
       <th>Deviation % / Avvik</th><th>Issued / Utstedt</th></tr></thead>
     <tbody>{empirical_rows}</tbody>
   </table>
+  <h2>Hourly daylight verification / Timevis dagslysverifikasjon</h2>
+  <p>{_escape(hourly_result.get('target_date') or 'No completed day / Ingen avsluttet dag')}</p>
+  <table>
+    <thead><tr><th>Target / Måltime</th><th>Forecast kWh</th>
+      <th>Actual kWh</th><th>Deviation kWh</th><th>Cloud %</th>
+      <th>Forecast °C</th><th>Actual °C</th><th>Lead h</th>
+      <th>Source / Kilde</th></tr></thead>
+    <tbody>{hourly_rows}</tbody>
+  </table>
   <p><a href="./api/forecast">JSON API</a> ·
     <a href="./api/history">Snapshots / Prognosehistorikk</a> ·
-    <a href="./api/empirics">Empirics / Empiri</a></p>
+    <a href="./api/empirics">Empirics / Empiri</a> ·
+    <a href="./api/hourly-comparison?target_date={_escape(hourly_result.get('target_date') or '')}">Hourly / Timevis</a></p>
 </main></body></html>"""
 
 
@@ -544,6 +884,13 @@ def _deviation_class(value):
 
 def _iso(value):
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc(value):
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def main():

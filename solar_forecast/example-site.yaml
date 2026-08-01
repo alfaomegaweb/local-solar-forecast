@@ -45,6 +45,7 @@ arrays:
     orientation: "south"
 
 measurements:
+  outdoor_temperature_statistic_entity: null
   solar_energy:
     aggregation: "sum"
     statistic_entities: []
@@ -55,4 +56,3 @@ output:
   include_hourly: true
   include_daily: true
   include_by_direction: true
-

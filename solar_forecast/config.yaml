@@ -1,5 +1,5 @@
 name: Local Solar Forecast
-version: "0.2.0"
+version: "0.3.0"
 slug: solar_forecast
 description: Generic, local solar forecast with immutable forecast history
 url: https://github.com/hovbjo99/local-solar-forecast
@@ -27,6 +27,7 @@ options:
   site_config_path: /config/solar_forecast/site.yaml
   refresh_minutes: 30
   history_days: 730
+  hourly_empirical_lookback_days: 90
   listen_port: 8099
   log_level: info
   legacy_history_path: /config/solar_forecast/legacy-forecast-snapshots.ndjson
@@ -34,6 +35,7 @@ schema:
   site_config_path: str
   refresh_minutes: int(5,360)
   history_days: int(30,3650)
+  hourly_empirical_lookback_days: int(2,730)
   listen_port: port
   log_level: list(debug|info|warning|error)
   legacy_history_path: str
