@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Normalize immutable hourly forecasts with issue, target and lead time.
+- Preserve raw MET/Open-Meteo/MEPS inputs with SHA-256 digests.
+- Add Open-Meteo Single Runs backfill and optional MEPS cloud-layer adapter.
+- Capture hourly HA Recorder PV/temperature observations.
+- Add daylight-only hourly comparison API and dashboard table.
+- Add bounded, versioned automatic temperature-residual calibration.
+- Remove forecast-history pruning.
+
 ## 0.2.0
 
 - Import immutable legacy `sun.php` forecast snapshots.

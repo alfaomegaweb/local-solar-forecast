@@ -11,11 +11,11 @@ import hashlib
 import json
 import math
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
-MODEL_VERSION = "local-solar-poa-0.1.0"
+MODEL_VERSION = "local-solar-poa-0.2.0"
 UTC = timezone.utc
 
 
@@ -207,6 +207,42 @@ def solar_position(when, latitude, longitude):
     return elevation, azimuth
 
 
+def sunrise_sunset(target_date, timezone_name, latitude, longitude):
+    """Calculate local sunrise and sunset by bracketing elevation zero."""
+    zone = ZoneInfo(timezone_name)
+    start = datetime.combine(target_date, time(0, 0), tzinfo=zone)
+    step = timedelta(minutes=5)
+    previous_time = start
+    previous_elevation = solar_position(previous_time, latitude, longitude)[0]
+    sunrise = None
+    sunset = None
+    current = start + step
+    end = start + timedelta(days=1)
+    while current <= end:
+        elevation = solar_position(current, latitude, longitude)[0]
+        if previous_elevation <= 0 < elevation and sunrise is None:
+            sunrise = _zero_crossing(
+                previous_time, current, previous_elevation, elevation
+            )
+        if previous_elevation > 0 >= elevation:
+            sunset = _zero_crossing(
+                previous_time, current, previous_elevation, elevation
+            )
+        previous_time = current
+        previous_elevation = elevation
+        current += step
+    return (
+        sunrise.isoformat() if sunrise else None,
+        sunset.isoformat() if sunset else None,
+    )
+
+
+def _zero_crossing(before, after, before_value, after_value):
+    span = after_value - before_value
+    fraction = 0.5 if span == 0 else max(0.0, min(1.0, -before_value / span))
+    return before + (after - before) * fraction
+
+
 def plane_incidence_cosine(solar_elevation, solar_azimuth, tilt, panel_azimuth):
     """Cosine of incidence angle between sun ray and panel normal."""
     elevation = math.radians(solar_elevation)
@@ -275,14 +311,34 @@ def _weather_at(item):
     data = item.get("data") or {}
     details = ((data.get("instant") or {}).get("details") or {})
     symbol = _weather_symbol(data)
-    cloud = details.get("cloud_area_fraction")
-    cloud = None if cloud is None else max(0.0, min(100.0, float(cloud)))
+    cloud = _percent_or_none(details.get("cloud_area_fraction"))
     temperature = details.get("air_temperature")
     temperature = 20.0 if temperature is None else float(temperature)
     return {
         "symbol_code": symbol,
         "cloud_area_fraction_percent": cloud,
+        "cloud_area_fraction_low_percent": _percent_or_none(
+            details.get("cloud_area_fraction_low")
+        ),
+        "cloud_area_fraction_medium_percent": _percent_or_none(
+            details.get("cloud_area_fraction_medium")
+        ),
+        "cloud_area_fraction_high_percent": _percent_or_none(
+            details.get("cloud_area_fraction_high")
+        ),
         "air_temperature_c": temperature,
+        "shortwave_radiation_w_m2": _nonnegative_or_none(
+            details.get("shortwave_radiation")
+        ),
+        "direct_radiation_w_m2": _nonnegative_or_none(
+            details.get("direct_radiation")
+        ),
+        "diffuse_radiation_w_m2": _nonnegative_or_none(
+            details.get("diffuse_radiation")
+        ),
+        "direct_normal_irradiance_w_m2": _nonnegative_or_none(
+            details.get("direct_normal_irradiance")
+        ),
     }
 
 
@@ -306,6 +362,60 @@ def _clear_sky_ghi(elevation):
     return 1098.0 * cos_zenith * math.exp(-0.059 / cos_zenith)
 
 
+def _percent_or_none(value):
+    if value is None:
+        return None
+    return max(0.0, min(100.0, float(value)))
+
+
+def _nonnegative_or_none(value):
+    if value is None:
+        return None
+    return max(0.0, float(value))
+
+
+def _irradiance_components(elevation, weather):
+    """Return GHI, direct horizontal, DHI and DNI in W/m².
+
+    Archived providers can supply the original radiation fields. Live MET
+    Locationforecast currently does not, so the physical clear-sky/cloud model
+    remains the documented fallback.
+    """
+    if elevation <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    cos_zenith = max(0.001, math.sin(math.radians(elevation)))
+    supplied_ghi = weather.get("shortwave_radiation_w_m2")
+    supplied_direct = weather.get("direct_radiation_w_m2")
+    supplied_diffuse = weather.get("diffuse_radiation_w_m2")
+    supplied_dni = weather.get("direct_normal_irradiance_w_m2")
+
+    if supplied_ghi is not None:
+        ghi = supplied_ghi
+        if supplied_diffuse is None and supplied_direct is not None:
+            supplied_diffuse = max(0.0, ghi - supplied_direct)
+        if supplied_direct is None and supplied_diffuse is not None:
+            supplied_direct = max(0.0, ghi - supplied_diffuse)
+        if supplied_direct is None and supplied_dni is not None:
+            supplied_direct = max(0.0, supplied_dni * cos_zenith)
+        if supplied_diffuse is None:
+            supplied_diffuse = ghi * 0.35
+        if supplied_direct is None:
+            supplied_direct = max(0.0, ghi - supplied_diffuse)
+        if supplied_dni is None:
+            supplied_dni = supplied_direct / max(0.08, cos_zenith)
+        return ghi, supplied_direct, supplied_diffuse, supplied_dni
+
+    clear_ghi = _clear_sky_ghi(elevation)
+    transmission = _transmission(weather)
+    ghi = clear_ghi * transmission
+    diffuse_fraction = min(0.90, 0.15 + 0.65 * (1.0 - transmission))
+    dhi = ghi * diffuse_fraction
+    direct_horizontal = max(0.0, ghi - dhi)
+    dni = direct_horizontal / max(0.08, cos_zenith)
+    return ghi, direct_horizontal, dhi, dni
+
+
 def _interval_samples(timeseries, issued_at):
     """Expand MET's later 6-hour spacing to hourly samples."""
     parsed = []
@@ -317,7 +427,7 @@ def _interval_samples(timeseries, issued_at):
     parsed.sort(key=lambda row: row[0])
 
     for index, (start, item) in enumerate(parsed):
-        if start + timedelta(hours=1) <= issued_at:
+        if start < issued_at:
             continue
         if index + 1 < len(parsed):
             hours = (parsed[index + 1][0] - start).total_seconds() / 3600.0
@@ -327,7 +437,7 @@ def _interval_samples(timeseries, issued_at):
         weather = _weather_at(item)
         for offset in range(hours):
             sample_start = start + timedelta(hours=offset)
-            if sample_start + timedelta(hours=1) <= issued_at:
+            if sample_start < issued_at:
                 continue
             yield sample_start, 1.0, weather
 
@@ -337,14 +447,9 @@ def _array_power(array, solar, weather, model):
     if elevation <= float(model.get("minimum_solar_elevation_deg", 0)):
         return 0.0, 0.0
 
-    cos_zenith = math.sin(math.radians(elevation))
-    clear_ghi = _clear_sky_ghi(elevation)
-    transmission = _transmission(weather)
-    ghi = clear_ghi * transmission
-    diffuse_fraction = min(0.90, 0.15 + 0.65 * (1.0 - transmission))
-    dhi = ghi * diffuse_fraction
-    direct_horizontal = max(0.0, ghi - dhi)
-    dni = direct_horizontal / max(0.08, cos_zenith)
+    ghi, direct_horizontal, dhi, dni = _irradiance_components(
+        elevation, weather
+    )
 
     incidence = plane_incidence_cosine(
         elevation,
@@ -406,6 +511,7 @@ def build_forecast(site_config, met_payload, issued_at=None):
     local_zone = ZoneInfo(site["timezone"])
     by_day = {}
     hourly = []
+    sun_windows = {}
     total_by_direction = defaultdict(float)
     total_by_array = defaultdict(float)
 
@@ -416,6 +522,9 @@ def build_forecast(site_config, met_payload, issued_at=None):
             midpoint_local,
             site["latitude"],
             site["longitude"],
+        )
+        ghi, direct_horizontal, dhi, dni = _irradiance_components(
+            elevation, weather
         )
 
         energy_by_direction = defaultdict(float)
@@ -441,10 +550,23 @@ def build_forecast(site_config, met_payload, issued_at=None):
         expected_kwh = power_total * interval_hours
         local_start = interval_start.astimezone(local_zone)
         date_key = local_start.date().isoformat()
+        if date_key not in sun_windows:
+            sun_windows[date_key] = sunrise_sunset(
+                local_start.date(),
+                site["timezone"],
+                site["latitude"],
+                site["longitude"],
+            )
+        sunrise, sunset = sun_windows[date_key]
         hourly_item = {
             "time": interval_start.isoformat().replace("+00:00", "Z"),
+            "target_time": interval_start.isoformat().replace("+00:00", "Z"),
             "local_time": local_start.isoformat(),
             "target_date": date_key,
+            "forecast_issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+            "lead_hours": round(
+                (interval_start - issued_at).total_seconds() / 3600.0, 3
+            ),
             "interval_hours": interval_hours,
             "estimated_power_kw": round(power_total, 3),
             "expected_kwh": round(expected_kwh, 3),
@@ -452,10 +574,26 @@ def build_forecast(site_config, met_payload, issued_at=None):
             "expected_kwh_by_array": _rounded_dict(energy_by_array, 3),
             "solar_elevation_deg": round(elevation, 2),
             "solar_azimuth_deg": round(sun_azimuth, 2),
+            "is_day": elevation > 0,
+            "sunrise": sunrise,
+            "sunset": sunset,
+            "ghi_w_m2": round(ghi, 2),
+            "direct_radiation_w_m2": round(direct_horizontal, 2),
+            "diffuse_radiation_w_m2": round(dhi, 2),
+            "direct_normal_irradiance_w_m2": round(dni, 2),
             "poa_w_m2_by_array": _rounded_dict(poa_by_array, 1),
             "air_temperature_c": round(weather["air_temperature_c"], 1),
             "cloud_area_fraction_percent": weather[
                 "cloud_area_fraction_percent"
+            ],
+            "cloud_area_fraction_low_percent": weather[
+                "cloud_area_fraction_low_percent"
+            ],
+            "cloud_area_fraction_medium_percent": weather[
+                "cloud_area_fraction_medium_percent"
+            ],
+            "cloud_area_fraction_high_percent": weather[
+                "cloud_area_fraction_high_percent"
             ],
             "symbol_code": weather["symbol_code"],
         }
@@ -481,6 +619,8 @@ def build_forecast(site_config, met_payload, issued_at=None):
                     ),
                     1,
                 ),
+                "sunrise": sunrise,
+                "sunset": sunset,
                 "expected_kwh": 0.0,
                 "expected_kwh_by_direction": defaultdict(float),
                 "expected_kwh_by_array": defaultdict(float),

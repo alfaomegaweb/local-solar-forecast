@@ -145,18 +145,18 @@ measurements:
   solar_power:
     aggregation: "sum"
     entities: []
+  # Long-term-statistics entity used for hourly forecast verification.
+  outdoor_temperature_statistic_entity: null
   outdoor_temperature_entity: null
 
 calibration:
   enabled: true
-  minimum_training_days: 30
-  rolling_window_days: 90
-  separate_by:
-    - "array"
-    - "month"
-    - "hour"
-    - "weather_class"
-    - "forecast_horizon"
+  algorithm: "bounded-temperature-residual-1"
+  minimum_training_hours: 48
+  rolling_window_days: 180
+  factor_min: 0.70
+  factor_max: 1.30
+  minimum_mae_improvement_percent: 2
   metrics:
     - "wmape"
     - "bias"
