@@ -1,5 +1,5 @@
 name: Local Solar Forecast
-version: "0.5.3"
+version: "0.5.4"
 slug: solar_forecast
 description: Generic, local solar forecast with immutable forecast history
 url: https://github.com/alfaomegaweb/local-solar-forecast

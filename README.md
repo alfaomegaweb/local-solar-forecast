@@ -26,6 +26,8 @@ hourly and daily values, including totals per panel direction and array.
 
 - `solar_forecast/` — installable Home Assistant app
 - `solar_forecast/site-template.yaml` — generic PV layout template
+- `node-red/lsf-work-limit-mqtt-dry-run-flow.json` — importable, non-actuating
+  Node-RED receiver for version 0.5.4 work-limit proposals
 
 Installation and API details are in
 [`solar_forecast/DOCS.md`](solar_forecast/DOCS.md).

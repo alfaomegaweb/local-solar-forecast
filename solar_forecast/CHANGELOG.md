@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.4
+
+- Add one versioned BB86 Node-RED tab containing independent machine-health
+  and MQTT work-limit dry-run lines. The sanitized flow never embeds the
+  health webhook, never calls a Home Assistant service and cannot change the
+  live work limit.
+- Require site ID, decision ID, issue time and expiry time, and reject stale
+  or duplicate proposals before displaying the selected input-select option.
+
 ## 0.5.3
 
 - Open the preserved import database in SQLite immutable mode so migration
