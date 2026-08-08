@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 UTC = timezone.utc
-ALGORITHM_VERSION = "bounded-temperature-residual-1"
+ALGORITHM_VERSION = "bounded-temperature-residual-2"
 
 
 def fit_calibration(
@@ -14,46 +15,82 @@ def fit_calibration(
     site_id,
     timezone_name,
     minimum_samples=48,
+    minimum_complete_days=3,
+    minimum_valid_hours_per_day=4,
+    rolling_window_days=180,
     factor_min=0.70,
     factor_max=1.30,
     minimum_mae_improvement_percent=2.0,
+    minimum_actual_kwh=0.01,
+    required_measurement_source_fingerprint=None,
 ):
-    rows = []
+    today = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+    trusted_daily_dates = {
+        item["target_date"]
+        for item in history.list_actuals(
+            site_id,
+            limit=max(int(rolling_window_days), int(minimum_complete_days)),
+        )
+        if (item.get("details") or {}).get("quality_valid") is True
+        and (
+            required_measurement_source_fingerprint is None
+            or (item.get("details") or {}).get(
+                "measurement_source_fingerprint"
+            )
+            == required_measurement_source_fingerprint
+        )
+        and item["target_date"] < today
+    }
+    usable_by_day = {}
     for target_date in history.hourly_actual_dates(
-        site_id, timezone_name, limit=180
+        site_id, timezone_name, limit=int(rolling_window_days)
     ):
-        rows.extend(
-            history.hourly_comparisons(
-                site_id, target_date, timezone_name
-            )["hours"]
-        )
-    usable = []
-    for row in rows:
-        predicted = row["forecast_kwh"]
-        actual = row["actual_kwh"]
-        temperature = (
-            row["actual_temperature_c"]
-            if row["actual_temperature_c"] is not None
-            else row["forecast_temperature_c"]
-        )
-        if (
-            predicted is None
-            or actual is None
-            or temperature is None
-            or predicted < 0.25
-            or row["solar_elevation_deg"] < 5
-        ):
+        if target_date not in trusted_daily_dates or target_date >= today:
             continue
-        usable.append(
-            {
-                "target_time": row["target_time"],
-                "predicted": float(predicted),
-                "actual": max(0.0, float(actual)),
-                "x": float(temperature) - 25.0,
-                "weight": max(0.25, float(predicted)),
-            }
-        )
-    if len(usable) < int(minimum_samples):
+        day_rows = []
+        for row in history.hourly_comparisons(
+            site_id, target_date, timezone_name
+        )["hours"]:
+            predicted = row["forecast_kwh"]
+            actual = row["actual_kwh"]
+            temperature = (
+                row["actual_temperature_c"]
+                if row["actual_temperature_c"] is not None
+                else row["forecast_temperature_c"]
+            )
+            if (
+                row.get("actual_quality_valid") is not True
+                or (
+                    required_measurement_source_fingerprint is not None
+                    and row.get("actual_measurement_source_fingerprint")
+                    != required_measurement_source_fingerprint
+                )
+                or predicted is None
+                or actual is None
+                or temperature is None
+                or predicted < 0.25
+                or actual < float(minimum_actual_kwh)
+                or row["solar_elevation_deg"] < 5
+            ):
+                continue
+            day_rows.append(
+                {
+                    "target_time": row["target_time"],
+                    "predicted": float(predicted),
+                    "actual": max(0.0, float(actual)),
+                    "x": float(temperature) - 25.0,
+                    "weight": max(0.25, float(predicted)),
+                }
+            )
+        if len(day_rows) >= int(minimum_valid_hours_per_day):
+            usable_by_day[target_date] = day_rows
+
+    training_days = sorted(usable_by_day)
+    usable = [row for day in training_days for row in usable_by_day[day]]
+    if (
+        len(training_days) < int(minimum_complete_days)
+        or len(usable) < int(minimum_samples)
+    ):
         return None
 
     weight_sum = sum(item["weight"] for item in usable)
@@ -112,6 +149,11 @@ def fit_calibration(
         "training_start": min(item["target_time"] for item in usable),
         "training_end": max(item["target_time"] for item in usable),
         "sample_count": len(usable),
+        "training_day_count": len(training_days),
+        "training_days": training_days,
+        "measurement_source_fingerprint": (
+            required_measurement_source_fingerprint
+        ),
         "intercept_factor": round(intercept, 8),
         "temperature_slope_per_c": round(slope, 8),
         "mae_before_kwh": round(before, 8),
@@ -119,7 +161,16 @@ def fit_calibration(
         "accepted": accepted,
         "guardrails": {
             "minimum_samples": int(minimum_samples),
+            "minimum_complete_days": int(minimum_complete_days),
+            "minimum_valid_hours_per_day": int(minimum_valid_hours_per_day),
+            "rolling_window_days": int(rolling_window_days),
+            "requires_trusted_daily_observation": True,
+            "requires_quality_valid_hourly_observation": True,
+            "requires_current_measurement_source": (
+                required_measurement_source_fingerprint is not None
+            ),
             "minimum_forecast_kwh": 0.25,
+            "minimum_actual_kwh": float(minimum_actual_kwh),
             "minimum_solar_elevation_deg": 5,
             "factor_min": factor_min,
             "factor_max": factor_max,
@@ -181,6 +232,8 @@ def apply_calibration(forecast, calibration):
             "training_start",
             "training_end",
             "sample_count",
+            "training_day_count",
+            "training_days",
             "intercept_factor",
             "temperature_slope_per_c",
             "mae_before_kwh",

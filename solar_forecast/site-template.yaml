@@ -9,6 +9,58 @@
 
 schema_version: 1
 
+# vNext placeholder: discovery is the first phase of every installation and
+# may be rerun without deleting historical observations. It proposes mappings;
+# it never silently authorizes control or merges a new source with old history.
+initialization:
+  discovery:
+    enabled: true
+    mode: "proposal_only"
+    state: "not_run"
+    schema: "lsf-site-discovery/1"
+    discover:
+      - "site_geodata_and_timezone"
+      - "pv_energy_and_power"
+      - "battery_soc_charge_and_discharge"
+      - "grid_import_export"
+      - "base_load_inputs"
+      - "outdoor_temperature"
+      - "weather_hourly_forecast"
+      - "nord_pool_price_intervals"
+      - "work_limit_and_absolute_grid_limit"
+      - "inverter_and_battery_inventory"
+    evidence_required:
+      statistics_metadata: true
+      unit_and_device_class: true
+      monotonic_energy_check: true
+      freshness_check: true
+      cross_entity_energy_balance: true
+      minimum_observation_hours: 24
+    rerun_triggers:
+      - "configured_entity_missing"
+      - "entity_unknown_or_unavailable_beyond_grace_period"
+      - "measurement_source_fingerprint_changed"
+      - "device_or_integration_replaced"
+      - "unit_or_device_class_changed"
+      - "persistent_energy_balance_failure"
+      - "owner_or_facilitator_requested"
+    rerun_policy:
+      automatic_detection_allowed: true
+      preserve_previous_mapping_and_history: true
+      create_new_measurement_source_regime: true
+      require_confirmation_before_control_mapping_change: true
+      actuation_during_discovery: false
+      fail_closed_when_required_input_is_unresolved: true
+    output:
+      proposed_site_profile: true
+      confidence_per_mapping: true
+      unresolved_requirements: true
+      evidence_fingerprint: true
+      discovery_started_at: true
+      discovery_completed_at: true
+      approved_by: null
+      approved_at: null
+
 site:
   id: "REPLACE_ME"
   name: "REPLACE_ME"
@@ -22,6 +74,61 @@ weather:
   provider: "met_no_locationforecast"
   provider_url: "https://api.met.no/weatherapi/locationforecast/2.0/compact"
   user_agent: "REPLACE_ME/1.0 (REPLACE_WITH_CONTACT_OR_WEB_ADDRESS)"
+
+# Nord Pool area is proposed from site geodata, but dispatch remains blocked
+# until the proposal has been confirmed. See NORD-POOL-CONTRACT.md.
+nord_pool:
+  enabled: false
+  bidding_area:
+    proposed: null
+    confirmed: null
+    confirmation_status: "proposed"
+    confidence: "low"
+    basis: "site_geodata"
+    confirmed_by: null
+    confirmed_at: null
+  price:
+    entity: null
+    currency: "NOK"
+    unit: "NOK/kWh"
+    vat_included: true
+    granularity: "source_native"
+    current_value: "state"
+    today_attribute: "today"
+    tomorrow_attribute: "tomorrow"
+    tomorrow_valid_attribute: "tomorrow_valid"
+
+# Site-size classification for LSF vNext. The category controls modelling and
+# validation depth; explicit inverter/BMS limits always control actuation.
+system_scope:
+  category: null # compact | expanded | large
+  category_source: null # inventory | facilitator_override
+  inverter:
+    count: null
+    total_nominal_power_kw: null
+    largest_unit_power_kw: null
+  battery:
+    pack_count: null
+    nominal_energy_kwh: null
+    usable_energy_kwh: null
+  classification_rules:
+    compact: "inverter_up_to_12_kw_and_pack_count_up_to_3"
+    expanded: "pack_count_4_to_8_or_deye_20_kw"
+    large: "pack_count_over_8_or_multiple_high_power_inverters_or_complex_multibank_site"
+  modelling:
+    compact: "aggregate_model_allowed"
+    expanded: "separate_inverter_and_battery_bank_model_preferred"
+    large: "per_inverter_and_per_dispatch_bank_telemetry_required"
+  facilitator_override:
+    allowed: true
+    active_override: null
+    requires: ["facilitator_id", "reason", "inventory_evidence", "set_at", "review_at"]
+
+# Sites without solar are supported. Set mode to none, use arrays: [], leave
+# solar measurement entities empty and disable PV calibration. LSF will return
+# an explicit zero-solar forecast while load/price/battery planning continues.
+pv:
+  mode: "installed" # installed | none
 
 model:
   mode: "physical_plane_of_array"
@@ -142,6 +249,16 @@ measurements:
     # from Home Assistant Recorder and stored as immutable observations.
     statistic_entities: []
     current_day_entities: []
+    data_quality:
+      # A completed daily observation is accepted only when every configured
+      # production meter contributed a non-negative Recorder change.
+      require_all_entities: true
+      minimum_daily_total_kwh: 0.05
+      # Reject unit/entity faults that imply impossible daily production.
+      maximum_daily_specific_yield_kwh_per_kwp: 8.0
+      # Explicit opt-in. Adds reversible exclusion markers to preserved legacy
+      # observations that violate these gates; raw rows are never deleted.
+      auto_quarantine_existing: false
   solar_power:
     aggregation: "sum"
     entities: []
@@ -149,14 +266,339 @@ measurements:
   outdoor_temperature_statistic_entity: null
   outdoor_temperature_entity: null
 
+# New sites start conservatively at moderately_stable. LSF may change the
+# category only from preserved site data and must expose its evidence.
+load_model:
+  stability_category: "moderately_stable"
+  stability_category_source: "bootstrap_until_empirically_proven"
+  daily_energy:
+    calculated_entity: "sensor.lsf_base_load_daily_kwh"
+    fallback_kwh_per_day: null
+    fallback_source: null
+    expose_value_source_in_status: true
+  governance:
+    facilitator_override_allowed: true
+    active_override: null
+    override_requires: ["facilitator_id", "reason", "evidence_period", "set_at", "review_at"]
+    precedence: ["safety_fallback", "active_facilitator_override", "learned_classification", "owner_confirmed_bootstrap"]
+    expose_override_in_status: true
+  categories:
+    very_stable: {norwegian_label: "meget stabil", maximum_robust_cv: 0.10}
+    moderately_stable: {norwegian_label: "moderat stabil", maximum_robust_cv: 0.25}
+    low_stability: {norwegian_label: "lite stabil", maximum_robust_cv: null}
+  classifier:
+    rolling_window_days: 28
+    minimum_complete_days: 7
+    resolution_minutes: 15
+    separate_weekday_and_weekend_profiles: true
+    temperature_adjustment: "learn_only_after_significant_relationship"
+    estimator: "time_of_day_median_with_mad_uncertainty"
+    preserve_outliers: true
+  dispatch:
+    use_upper_uncertainty_bound_for_load_budget: true
+    unknown_or_low_confidence_fallback: "moderately_stable_with_conservative_margin"
+    expose_category_confidence_and_training_period: true
+
+# Required for battery sites, and especially important when pv.mode is none.
+# Battery circulation is not building load and must be modelled separately.
+energy_flow_model:
+  sign_convention:
+    grid_import_positive: true
+    grid_export_negative: true
+  base_load_balance:
+    with_pv: "pv + grid_import + battery_discharge - grid_export - battery_charge"
+    without_pv: "grid_import + battery_discharge - grid_export - battery_charge"
+  inverter_throughput:
+    formula: "battery_charge_energy + battery_discharge_energy"
+    track_daily_kwh: true
+    track_charge_kwh: true
+    track_discharge_kwh: true
+    track_conversion_loss_kwh: true
+    track_equivalent_full_cycles: true
+    preserve_raw_counters: true
+  classification:
+    exclude_battery_circulation_from_base_load: true
+    expose_throughput_confidence_and_source_entities: true
+
+planning:
+  soc_checkpoint:
+    short_label: "SOC-KP"
+    minutes_before_sunset: 60
+    target_soc_percent: 95
+    operational_target_soc_percent: 96
+  horizon:
+    start: "upcoming_soc_checkpoint"
+    end: "following_day_soc_checkpoint"
+  hourly_plan_entity: "sensor.lsf_soc_checkpoint_plan"
+  hourly_plan_attribute: "hours"
+  required_hour_fields:
+    - "start"
+    - "end"
+    - "nord_pool_raw_nok_per_kwh"
+    - "calculated_work_limit_kw"
+    - "proposed_work_limit_kw"
+    - "work_limit_option"
+    - "solar_kwh"
+    - "load_kwh"
+    - "projected_soc_percent"
+    - "soc_checkpoint_deviation_percentage_points"
+    - "corrective_action"
+    - "reason"
+  deviation_definition: "projected_soc_percent_minus_required_soc_trajectory_percent"
+  corrective_control:
+    enabled: true
+    trigger: "soc_checkpoint_deviation_outside_deadband"
+    deadband_percentage_points: 1.0
+    negative_deviation_action: "reduce_export_or_allow_more_charging"
+    positive_deviation_action: "move_export_to_highest_value_hours_without_missing_target"
+    recalculate_after_each_observation: true
+  work_limit_quantization:
+    options_source_entity: "input_select.deye_work_limit"
+    strategy: "nearest_numeric_option"
+    tie_break: "nearest_zero"
+    reject_value_not_present_in_entity_options: true
+    expose_calculated_and_selected_values: true
+    sign_convention: "positive_import_negative_export"
+    upper_import_guard_entity: "input_select.absolutt_limit_grid"
+    never_exceed_absolute_import_limit: true
+
+# Placeholder contract for the future LSF energy regulator. This section is
+# intentionally observation-only in 0.5.x: it defines inputs, outputs, safety
+# invariants and decision semantics, but does not authorize actuator writes.
+energy_regulator_vnext:
+  enabled: false
+  mode: "observe_only" # observe_only | supervised | active
+  actuation_authorized: false
+  actuator_owner: "site_local_automation"
+  replan_interval_minutes: 15
+
+  # Read-only mapping from site-specific HA entities to one common regulator
+  # observation. Enabling this does not enable regulation. Every required
+  # entity must have a numeric, timestamped and sufficiently fresh state.
+  # An entity replacement creates a new source fingerprint/regime instead of
+  # silently continuing the old measurement series.
+  collector:
+    enabled: false
+    schema: "lsf-ha-observation/1"
+    read_method: "home_assistant_get_api_states"
+    service_calls_allowed: false
+    maximum_state_age_seconds: 900
+    sign_convention: "positive_import_negative_export"
+    entities:
+      battery_soc: null
+      base_load_power: null # optional; otherwise daily fallback / 24 is explicit
+      work_limit: "input_select.deye_work_limit"
+      absolute_import_limit: "input_select.absolutt_limit_grid"
+      grid_power: null
+      battery_charge_power: null
+      battery_discharge_power: null
+    nord_pool:
+      enabled: false
+      # Day-ahead series may legitimately be older than live telemetry.
+      maximum_state_age_seconds: 108000
+      # One or more template sensors containing source-native interval objects
+      # with start, end and price/price_nok_per_kwh. Numeric arrays without
+      # interval boundaries are deliberately rejected.
+      entities: []
+      intervals_attribute: "intervals"
+      accepted_interval_minutes: [15, 60]
+      missing_tomorrow_policy: "unknown_not_invented"
+    static:
+      usable_battery_kwh: null
+      minimum_soc_percent: null
+      target_checkpoint_soc_percent: 95
+      # Runtime integration replaces this with the next solar-derived SOC-KP.
+      checkpoint_at: null
+      grid_margin_kw: 0.5
+      minimum_active_export_kw: 0.25
+      maximum_export_kw: null
+
+  objectives:
+    primary: "avoid_grid_import_when_physically_feasible"
+    secondary: "maximize_export_value_after_all_reserves_are_funded"
+    soc_checkpoint_is_soft_target: true
+    desired_soc_at_checkpoint_percent: 95
+    explain_when_target_is_infeasible: true
+
+  hard_constraints:
+    absolute_import_limit_entity: "input_select.absolutt_limit_grid"
+    never_exceed_absolute_import_limit: true
+    minimum_battery_soc_percent: null
+    normal_base_load_curtailment_allowed_in_solar_season: false
+    missing_or_stale_input_policy: "retain_last_safe_plan_and_block_aggressive_export"
+    positive_work_limit_means_import: true
+    negative_work_limit_means_export: true
+
+  # Season is inferred from local solar availability and recent observations,
+  # not solely from calendar months. Hysteresis prevents mode oscillation.
+  season_model:
+    strategy: "geodata_solar_availability_with_hysteresis"
+    solar_season_label: "summer"
+    non_solar_season_label: "winter"
+    calendar_months_are_advisory_only: true
+    enter_after_consecutive_qualifying_days: 5
+    leave_after_consecutive_non_qualifying_days: 5
+    minimum_useful_pv_energy_kwh_per_day: null
+    useful_pv_start_definition: "first_forecast_interval_where_pv_covers_expected_base_load"
+
+  forecast_horizons:
+    detailed_dispatch:
+      hours: 24
+      resolution_minutes: 15
+      authority: "may_propose_work_limit"
+    operational_reserve:
+      hours: 72
+      resolution_minutes: 60
+      authority: "may_block_export_and_schedule_import"
+    planning_reserve:
+      days: 5
+      resolution: "daily"
+      authority: "may_raise_reserve_and_block_aggressive_export"
+    risk_outlook:
+      maximum_days: 10
+      resolution: "daily"
+      authority: "risk_signal_only"
+    lead_time_confidence_weights:
+      day_1: 1.00
+      day_2: 0.85
+      day_3: 0.70
+      day_4_to_5: 0.50
+      day_6_to_10: 0.25
+
+  energy_balance:
+    interval_equation: >-
+      stored_energy_next = stored_energy + usable_pv + planned_import
+      - base_load - planned_export - conversion_loss
+    simulate_at_least:
+      - "no_voluntary_export"
+      - "minimum_export_only_when_surplus_must_leave_site"
+      - "value_weighted_export"
+      - "early_price_aware_import_when_required"
+    reject_plan_when:
+      - "minimum_soc_is_breached"
+      - "absolute_import_limit_is_breached"
+      - "required_energy_cannot_be_received_before_first_deficit"
+
+  reserve_model:
+    components:
+      - "base_load_until_next_useful_pv"
+      - "forecast_energy_deficit_until_next_sufficient_solar_period"
+      - "minimum_unavoidable_export"
+      - "battery_conversion_loss"
+      - "forecast_and_load_uncertainty_margin"
+    uncertainty_margin_percent:
+      stable_clear_weather: 10
+      variable_cloud: 20
+      prolonged_cloud: 30
+      stale_or_missing_forecast: 40
+    learn_margins_from_preserved_forecast_error: true
+    never_learn_away_hard_constraints: true
+
+  export_policy:
+    export_budget_equation: "available_energy_minus_required_multiday_reserve"
+    minimum_active_export_kw: 0.25
+    default_grid_target_kw_when_avoiding_import: -0.25
+    distribute_budget_to_highest_value_price_intervals: true
+    block_voluntary_export_when_budget_is_non_positive: true
+    allow_unavoidable_pv_surplus_export: true
+    future_cloud_can_revoke_next_day_export_budget: true
+
+  import_policy:
+    normally_avoid_import: true
+    allow_planned_import_when_required_for_feasibility: true
+    latest_safe_start_must_be_calculated: true
+    available_charge_power_equation: >-
+      absolute_import_limit - forecast_base_load - configured_grid_margin
+    schedule_priority:
+      - "cheapest_intervals_before_latest_safe_start"
+      - "earlier_available_intervals_if_cheap_capacity_is_insufficient"
+      - "any_feasible_interval_before_constraint_breach"
+    price_unknown_fallback: "protect_feasibility_before_price_optimization"
+    configured_grid_margin_kw: 0.5
+    import_states: ["none", "preparing_reserve", "scheduled", "constraint_squeeze", "emergency_guard"]
+
+  target_feasibility:
+    statuses: ["achievable", "at_risk", "infeasible_without_import_or_flexible_load"]
+    recalculate_after_each_observation: true
+    expose_best_achievable_soc_percent: true
+    expose_energy_shortfall_kwh: true
+    expose_reason: true
+
+  stability:
+    require_consecutive_material_forecast_changes: 2
+    normal_maximum_work_limit_steps_per_replan: 1
+    minimum_minutes_between_normal_changes: 15
+    immediate_replan_triggers:
+      - "absolute_import_limit_risk"
+      - "minimum_soc_risk"
+      - "material_observed_energy_deviation"
+    retain_previous_safe_plan_inside_deadband: true
+    soc_deadband_percentage_points: 1.0
+
+  work_limit:
+    options_source_entity: "input_select.deye_work_limit"
+    quantization: "nearest_numeric_option"
+    tie_break: "nearest_zero"
+    proposal_only_until_explicit_site_authorization: true
+
+  status_contract:
+    entity: "sensor.lsf_regulator_status"
+    hourly_plan_entity: "sensor.lsf_soc_checkpoint_plan"
+    required_fields:
+      - "decision_id"
+      - "calculated_at"
+      - "mode"
+      - "season_mode"
+      - "reason"
+      - "soc_now_percent"
+      - "soc_checkpoint_at"
+      - "soc_checkpoint_target_percent"
+      - "soc_checkpoint_feasibility"
+      - "projected_soc_at_checkpoint_percent"
+      - "lowest_projected_soc_percent"
+      - "lowest_projected_soc_at"
+      - "next_useful_pv_at"
+      - "base_load_until_useful_pv_kwh"
+      - "required_reserve_kwh"
+      - "uncertainty_margin_kwh"
+      - "export_budget_kwh"
+      - "import_need_kwh"
+      - "latest_safe_import_start"
+      - "absolute_import_limit_kw"
+      - "observed_work_limit_kw"
+      - "proposed_work_limit_kw"
+      - "selected_work_limit_option"
+      - "forecast_issued_at"
+      - "forecast_horizon_hours"
+      - "data_quality"
+    required_hour_fields:
+      - "start"
+      - "end"
+      - "nord_pool_raw_nok_per_kwh"
+      - "solar_kwh"
+      - "base_load_kwh"
+      - "planned_import_kwh"
+      - "planned_export_kwh"
+      - "projected_soc_percent"
+      - "required_reserve_soc_percent"
+      - "deviation_to_next_checkpoint_percentage_points"
+      - "calculated_work_limit_kw"
+      - "selected_work_limit_option"
+      - "reason"
+
 calibration:
   enabled: true
-  algorithm: "bounded-temperature-residual-1"
+  algorithm: "bounded-temperature-residual-2"
   minimum_training_hours: 48
+  minimum_training_days: 3
+  minimum_valid_hours_per_day: 4
   rolling_window_days: 180
   factor_min: 0.70
   factor_max: 1.30
   minimum_mae_improvement_percent: 2
+  # Zero/near-zero hourly observations are not safe learning samples because
+  # an entity replacement or Recorder gap can otherwise look like no sun.
+  minimum_actual_hourly_kwh: 0.01
   metrics:
     - "wmape"
     - "bias"
