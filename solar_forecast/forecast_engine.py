@@ -56,12 +56,24 @@ def validate_site_config(config):
     except Exception as exc:
         raise ConfigurationError("site.timezone must be a valid IANA timezone") from exc
 
+    pv = config.get("pv") or {}
+    pv_mode = str(pv.get("mode") or "installed").strip().lower()
+    if pv_mode not in {"installed", "none"}:
+        raise ConfigurationError("pv.mode must be installed or none")
+
     arrays = config.get("arrays")
-    if not isinstance(arrays, list) or not arrays:
-        raise ConfigurationError("at least one arrays entry is required")
+    if not isinstance(arrays, list):
+        raise ConfigurationError("arrays must be a list")
+    if pv_mode == "installed" and not arrays:
+        raise ConfigurationError(
+            "at least one arrays entry is required when pv.mode is installed"
+        )
+    if pv_mode == "none" and arrays:
+        raise ConfigurationError("arrays must be empty when pv.mode is none")
 
     normalized_arrays = []
     seen_ids = set()
+    calculated_panel_count = 0
     for index, item in enumerate(arrays):
         if not isinstance(item, dict):
             raise ConfigurationError(f"arrays[{index}] must be an object")
@@ -71,12 +83,28 @@ def validate_site_config(config):
         seen_ids.add(array_id)
 
         capacity = item.get("capacity_kwp")
+        module_count = item.get("module_count")
+        module_power_wp = item.get("module_power_wp")
         if capacity is None:
             capacity = (
-                _finite(item.get("module_count"), f"arrays[{index}].module_count")
-                * _finite(item.get("module_power_wp"), f"arrays[{index}].module_power_wp")
+                _finite(module_count, f"arrays[{index}].module_count")
+                * _finite(module_power_wp, f"arrays[{index}].module_power_wp")
                 / 1000.0
             )
+        elif module_count is not None and module_power_wp is not None:
+            declared_capacity = _finite(
+                capacity, f"arrays[{index}].capacity_kwp"
+            )
+            module_capacity = (
+                _finite(module_count, f"arrays[{index}].module_count")
+                * _finite(module_power_wp, f"arrays[{index}].module_power_wp")
+                / 1000.0
+            )
+            if abs(declared_capacity - module_capacity) > 0.01:
+                raise ConfigurationError(
+                    f"arrays[{index}].capacity_kwp does not match "
+                    "module_count × module_power_wp"
+                )
         capacity = _finite(capacity, f"arrays[{index}].capacity_kwp")
         tilt = _finite(item.get("tilt_deg"), f"arrays[{index}].tilt_deg")
         azimuth = _finite(item.get("azimuth_deg"), f"arrays[{index}].azimuth_deg") % 360
@@ -84,6 +112,15 @@ def validate_site_config(config):
             raise ConfigurationError(f"arrays[{index}].capacity_kwp must be positive")
         if not 0 <= tilt <= 180:
             raise ConfigurationError(f"arrays[{index}].tilt_deg must be between 0 and 180")
+        if module_count is not None:
+            normalized_count = _finite(
+                module_count, f"arrays[{index}].module_count"
+            )
+            if normalized_count <= 0 or not normalized_count.is_integer():
+                raise ConfigurationError(
+                    f"arrays[{index}].module_count must be a positive integer"
+                )
+            calculated_panel_count += int(normalized_count)
 
         orientation = str(item.get("orientation") or azimuth_to_direction(azimuth))
         normalized_arrays.append(
@@ -105,6 +142,89 @@ def validate_site_config(config):
     if not 0 < performance_ratio <= 1.2:
         raise ConfigurationError("model.base_performance_ratio must be in (0, 1.2]")
 
+    system = config.get("system") or {}
+    calculated_capacity = sum(item["capacity_kwp"] for item in normalized_arrays)
+    if system.get("installed_capacity_kwp") is not None:
+        declared = _finite(
+            system["installed_capacity_kwp"], "system.installed_capacity_kwp"
+        )
+        if abs(declared - calculated_capacity) > 0.01:
+            raise ConfigurationError(
+                "system.installed_capacity_kwp does not match arrays"
+            )
+    if system.get("panel_count") is not None:
+        declared_panels = _finite(system["panel_count"], "system.panel_count")
+        if not declared_panels.is_integer() or int(declared_panels) != calculated_panel_count:
+            raise ConfigurationError("system.panel_count does not match arrays")
+
+    measurements = config.get("measurements") or {}
+    solar_energy = measurements.get("solar_energy") or {}
+    statistic_entities = solar_energy.get("statistic_entities") or []
+    if pv_mode == "none" and statistic_entities:
+        raise ConfigurationError(
+            "PV statistic_entities are not allowed when pv.mode is none"
+        )
+    if solar_energy:
+        _validate_entity_ids(
+            statistic_entities,
+            "measurements.solar_energy.statistic_entities",
+            required=True,
+        )
+        current_entities = solar_energy.get("current_day_entities") or []
+        if current_entities:
+            _validate_entity_ids(
+                current_entities,
+                "measurements.solar_energy.current_day_entities",
+            )
+        quality = solar_energy.get("data_quality") or {}
+        if quality.get("require_all_entities", True) is not True:
+            raise ConfigurationError(
+                "measurements.solar_energy.data_quality.require_all_entities "
+                "must be true for safe empirical learning"
+            )
+        minimum_daily = _finite(
+            quality.get("minimum_daily_total_kwh", 0.05),
+            "measurements.solar_energy.data_quality.minimum_daily_total_kwh",
+        )
+        if minimum_daily <= 0:
+            raise ConfigurationError(
+                "minimum_daily_total_kwh must be greater than zero"
+            )
+        maximum_specific_yield = _finite(
+            quality.get("maximum_daily_specific_yield_kwh_per_kwp", 8.0),
+            (
+                "measurements.solar_energy.data_quality."
+                "maximum_daily_specific_yield_kwh_per_kwp"
+            ),
+        )
+        if not 0 < maximum_specific_yield <= 12:
+            raise ConfigurationError(
+                "maximum_daily_specific_yield_kwh_per_kwp must be in (0, 12]"
+            )
+
+    calibration = config.get("calibration") or {}
+    if pv_mode == "none" and calibration.get("enabled") is True:
+        raise ConfigurationError("PV calibration cannot be enabled when pv.mode is none")
+    if calibration.get("enabled") is True:
+        if not statistic_entities:
+            raise ConfigurationError(
+                "enabled calibration requires solar statistic_entities"
+            )
+        if calibration.get("algorithm") != "bounded-temperature-residual-2":
+            raise ConfigurationError(
+                "enabled calibration requires bounded-temperature-residual-2"
+            )
+        minimum_hours = int(calibration.get("minimum_training_hours", 48))
+        minimum_days = int(calibration.get("minimum_training_days", 3))
+        hours_per_day = int(calibration.get("minimum_valid_hours_per_day", 4))
+        rolling_days = int(calibration.get("rolling_window_days", 180))
+        if minimum_hours < 1 or minimum_days < 3 or hours_per_day < 1:
+            raise ConfigurationError("calibration training thresholds are unsafe")
+        if rolling_days < minimum_days:
+            raise ConfigurationError(
+                "calibration.rolling_window_days must cover minimum_training_days"
+            )
+
     return {
         **config,
         "site": {
@@ -115,6 +235,7 @@ def validate_site_config(config):
             "timezone": timezone_name,
         },
         "arrays": normalized_arrays,
+        "pv": {**pv, "mode": pv_mode},
         "model": {
             **model,
             "base_performance_ratio": performance_ratio,
@@ -133,6 +254,18 @@ def validate_site_config(config):
             ),
         },
     }
+
+
+def _validate_entity_ids(values, name, required=False):
+    if not isinstance(values, list) or (required and not values):
+        raise ConfigurationError(f"{name} must be a non-empty list")
+    normalized = []
+    for index, value in enumerate(values):
+        if not isinstance(value, str) or "." not in value or value.strip() != value:
+            raise ConfigurationError(f"{name}[{index}] is not a valid entity id")
+        normalized.append(value)
+    if len(normalized) != len(set(normalized)):
+        raise ConfigurationError(f"{name} contains duplicate entity ids")
 
 
 def azimuth_to_direction(azimuth):
@@ -689,6 +822,7 @@ def build_forecast(site_config, met_payload, issued_at=None):
             "timezone": site["timezone"],
         },
         "system": {
+            "pv_mode": (config.get("pv") or {}).get("mode", "installed"),
             "panel_count": sum(
                 int(item.get("module_count") or 0) for item in config["arrays"]
             ),

@@ -49,6 +49,9 @@ measurements:
   solar_energy:
     aggregation: "sum"
     statistic_entities: []
+    data_quality:
+      require_all_entities: true
+      minimum_daily_total_kwh: 0.05
   battery_soc_entity: null
 
 output:

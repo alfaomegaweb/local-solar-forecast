@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import copy
 import json
 import logging
 import math
@@ -25,6 +27,12 @@ except ModuleNotFoundError:  # Allows JSON-only local tests without PyYAML.
 from forecast_engine import MODEL_VERSION, build_forecast, validate_site_config
 from history_store import ForecastHistory
 from calibration import apply_calibration, fit_calibration
+from regulator import RegulatorInputError, build_observation_plan
+from ha_collector import (
+    HACollectorError,
+    collect_regulator_inputs,
+    next_soc_checkpoint,
+)
 
 
 UTC = timezone.utc
@@ -39,6 +47,105 @@ DEFAULT_OPTIONS = {
     "legacy_history_path": (
         "/config/solar_forecast/legacy-forecast-snapshots.ndjson"
     ),
+}
+
+DASHBOARD_TRANSLATIONS = {
+    "no": {
+        "language": "Språk", "running": "Kjører", "waiting": "Venter",
+        "site": "Anlegg", "forecast": "Prognose", "model": "Modell",
+        "empiricalDays": "Empiridøgn", "forecastAhead": "Prognose fremover",
+        "date": "Dato", "weather": "Vær", "hoursAhead": "Timer frem",
+        "forecastVsActual": "Prognose mot faktisk",
+        "fixedComparison": "Fast sammenligning: siste prognose kl. 18 eller tidligere dagen før.",
+        "actual": "Faktisk", "deviationKwh": "Avvik kWh",
+        "deviationPercent": "Avvik %", "issued": "Utstedt",
+        "hourlyVerification": "Timevis dagslysverifikasjon",
+        "target": "Måltime", "cloud": "Skydekke %",
+        "forecastTemp": "Prognose °C", "actualTemp": "Faktisk °C",
+        "source": "Kilde", "noCompletedDay": "Ingen avsluttet dag",
+        "snapshots": "Prognosehistorikk", "empirics": "Empiri",
+        "hourly": "Timevis"
+    },
+    "en": {
+        "language": "Language", "running": "Running", "waiting": "Waiting",
+        "site": "Site", "forecast": "Forecast", "model": "Model",
+        "empiricalDays": "Empirical days", "forecastAhead": "Forecast ahead",
+        "date": "Date", "weather": "Weather", "hoursAhead": "Hours ahead",
+        "forecastVsActual": "Forecast versus actual",
+        "fixedComparison": "Fixed comparison: latest forecast at or before 18:00 the previous day.",
+        "actual": "Actual", "deviationKwh": "Deviation kWh",
+        "deviationPercent": "Deviation %", "issued": "Issued",
+        "hourlyVerification": "Hourly daylight verification",
+        "target": "Target hour", "cloud": "Cloud %",
+        "forecastTemp": "Forecast °C", "actualTemp": "Actual °C",
+        "source": "Source", "noCompletedDay": "No completed day",
+        "snapshots": "Forecast history", "empirics": "Empirics",
+        "hourly": "Hourly"
+    },
+    "pt": {
+        "language": "Idioma", "running": "Em execução", "waiting": "A aguardar",
+        "site": "Instalação", "forecast": "Previsão", "model": "Modelo",
+        "empiricalDays": "Dias medidos", "forecastAhead": "Previsão futura",
+        "date": "Data", "weather": "Tempo", "hoursAhead": "Horas à frente",
+        "forecastVsActual": "Previsão versus real",
+        "fixedComparison": "Comparação fixa: última previsão até às 18:00 do dia anterior.",
+        "actual": "Real", "deviationKwh": "Desvio kWh",
+        "deviationPercent": "Desvio %", "issued": "Emitida",
+        "hourlyVerification": "Verificação horária com luz solar",
+        "target": "Hora-alvo", "cloud": "Nuvens %",
+        "forecastTemp": "Previsão °C", "actualTemp": "Real °C",
+        "source": "Fonte", "noCompletedDay": "Nenhum dia concluído",
+        "snapshots": "Histórico de previsões", "empirics": "Medições",
+        "hourly": "Horário"
+    },
+    "es": {
+        "language": "Idioma", "running": "En ejecución", "waiting": "En espera",
+        "site": "Instalación", "forecast": "Pronóstico", "model": "Modelo",
+        "empiricalDays": "Días medidos", "forecastAhead": "Pronóstico futuro",
+        "date": "Fecha", "weather": "Tiempo", "hoursAhead": "Horas por delante",
+        "forecastVsActual": "Pronóstico frente a real",
+        "fixedComparison": "Comparación fija: último pronóstico hasta las 18:00 del día anterior.",
+        "actual": "Real", "deviationKwh": "Desviación kWh",
+        "deviationPercent": "Desviación %", "issued": "Emitido",
+        "hourlyVerification": "Verificación horaria con luz solar",
+        "target": "Hora objetivo", "cloud": "Nubes %",
+        "forecastTemp": "Pronóstico °C", "actualTemp": "Real °C",
+        "source": "Fuente", "noCompletedDay": "Ningún día completado",
+        "snapshots": "Historial de pronósticos", "empirics": "Mediciones",
+        "hourly": "Horario"
+    },
+    "uk": {
+        "language": "Мова", "running": "Працює", "waiting": "Очікування",
+        "site": "Об’єкт", "forecast": "Прогноз", "model": "Модель",
+        "empiricalDays": "Дні вимірювань", "forecastAhead": "Майбутній прогноз",
+        "date": "Дата", "weather": "Погода", "hoursAhead": "Годин уперед",
+        "forecastVsActual": "Прогноз і фактичне значення",
+        "fixedComparison": "Фіксоване порівняння: останній прогноз до 18:00 попереднього дня.",
+        "actual": "Фактично", "deviationKwh": "Відхилення кВт·год",
+        "deviationPercent": "Відхилення %", "issued": "Створено",
+        "hourlyVerification": "Погодинна перевірка за денного світла",
+        "target": "Цільова година", "cloud": "Хмарність %",
+        "forecastTemp": "Прогноз °C", "actualTemp": "Фактично °C",
+        "source": "Джерело", "noCompletedDay": "Немає завершеного дня",
+        "snapshots": "Історія прогнозів", "empirics": "Вимірювання",
+        "hourly": "Погодинно"
+    },
+    "de": {
+        "language": "Sprache", "running": "Läuft", "waiting": "Wartet",
+        "site": "Anlage", "forecast": "Prognose", "model": "Modell",
+        "empiricalDays": "Messtage", "forecastAhead": "Künftige Prognose",
+        "date": "Datum", "weather": "Wetter", "hoursAhead": "Stunden voraus",
+        "forecastVsActual": "Prognose gegenüber Istwert",
+        "fixedComparison": "Fester Vergleich: letzte Prognose bis 18:00 Uhr am Vortag.",
+        "actual": "Istwert", "deviationKwh": "Abweichung kWh",
+        "deviationPercent": "Abweichung %", "issued": "Erstellt",
+        "hourlyVerification": "Stündliche Tageslichtprüfung",
+        "target": "Zielstunde", "cloud": "Bewölkung %",
+        "forecastTemp": "Prognose °C", "actualTemp": "Istwert °C",
+        "source": "Quelle", "noCompletedDay": "Kein abgeschlossener Tag",
+        "snapshots": "Prognoseverlauf", "empirics": "Messwerte",
+        "hourly": "Stündlich"
+    },
 }
 
 
@@ -84,10 +191,62 @@ class ServiceState:
         self.cache_path = data_dir / "met-locationforecast.json"
         self.history = ForecastHistory(data_dir / "forecast-history.sqlite")
         self.config = load_site_config(options["site_config_path"])
+        self._quarantine_existing_actuals()
         legacy_path = Path(str(options.get("legacy_history_path") or ""))
         if legacy_path.is_file():
             self.legacy_import = self.history.import_legacy_ndjson(legacy_path)
             LOG.info("Legacy forecast import: %s", self.legacy_import)
+
+    def _quarantine_existing_actuals(self):
+        """Apply explicit, reversible site quality gates to preserved history."""
+        solar_energy = (
+            (self.config.get("measurements") or {}).get("solar_energy") or {}
+        )
+        quality = solar_energy.get("data_quality") or {}
+        if quality.get("auto_quarantine_existing") is not True:
+            return {"enabled": False, "candidates": 0, "inserted": 0}
+        minimum_total = float(quality.get("minimum_daily_total_kwh", 0.05))
+        maximum_specific_yield = float(
+            quality.get("maximum_daily_specific_yield_kwh_per_kwp", 8.0)
+        )
+        installed_capacity = sum(
+            float(item["capacity_kwp"]) for item in self.config["arrays"]
+        )
+        maximum_total = installed_capacity * maximum_specific_yield
+        site_id = self.config["site"]["id"]
+        findings = self.history.audit_daily_actuals(
+            site_id,
+            zero_threshold_kwh=minimum_total,
+            maximum_daily_kwh=maximum_total,
+        )
+        candidates = [
+            item for item in findings if item["reasons"] and not item["excluded"]
+        ]
+        result = self.history.exclude_observations(
+            site_id,
+            "daily",
+            [item["observation_id"] for item in candidates],
+            "automatic_site_data_quality_gate",
+            details={
+                "minimum_daily_total_kwh": minimum_total,
+                "maximum_daily_specific_yield_kwh_per_kwp": (
+                    maximum_specific_yield
+                ),
+                "maximum_daily_total_kwh": maximum_total,
+                "raw_observations_preserved": True,
+            },
+        )
+        LOG.info(
+            "Historical empirical quarantine: candidates=%s inserted=%s",
+            len(candidates),
+            result["inserted"],
+        )
+        return {
+            "enabled": True,
+            "candidates": len(candidates),
+            "inserted": result["inserted"],
+            "missing": result["missing"],
+        }
 
     def refresh(self):
         now = datetime.now(UTC)
@@ -113,7 +272,7 @@ class ServiceState:
             calibration_options = self.config.get("calibration") or {}
             calibration = (
                 self.history.active_calibration(self.config["site"]["id"])
-                if calibration_options.get("enabled", True)
+                if calibration_options.get("enabled", False)
                 else None
             )
             apply_calibration(forecast, calibration)
@@ -161,13 +320,40 @@ class ServiceState:
                     minimum_samples=calibration_options.get(
                         "minimum_training_hours", 48
                     ),
+                    minimum_complete_days=calibration_options.get(
+                        "minimum_training_days", 3
+                    ),
+                    minimum_valid_hours_per_day=calibration_options.get(
+                        "minimum_valid_hours_per_day", 4
+                    ),
+                    rolling_window_days=calibration_options.get(
+                        "rolling_window_days", 180
+                    ),
                     factor_min=calibration_options.get("factor_min", 0.70),
                     factor_max=calibration_options.get("factor_max", 1.30),
                     minimum_mae_improvement_percent=calibration_options.get(
                         "minimum_mae_improvement_percent", 2
                     ),
+                    minimum_actual_kwh=calibration_options.get(
+                        "minimum_actual_hourly_kwh", 0.01
+                    ),
+                    required_measurement_source_fingerprint=(
+                        _measurement_source_details(
+                            (
+                                (self.config.get("measurements") or {})
+                                .get("solar_energy", {})
+                                .get("statistic_entities", [])
+                            ),
+                            aggregation=(
+                                (self.config.get("measurements") or {})
+                                .get("solar_energy", {})
+                                .get("aggregation", "sum")
+                            ),
+                            normalized_unit="kWh",
+                        )["measurement_source_fingerprint"]
+                    ),
                 )
-                if calibration_options.get("enabled", True)
+                if calibration_options.get("enabled", False)
                 else None
             )
             if learned:
@@ -200,11 +386,47 @@ class ServiceState:
             with self.lock:
                 self.last_error = str(exc)
 
-    def refresh_actuals(self):
-        statistic_ids = (
-            ((self.config.get("measurements") or {}).get("solar_energy") or {})
-            .get("statistic_entities", [])
+    def collect_regulator_observation(self, collected_at=None):
+        """Read and normalize HA states without invoking any HA service."""
+        contract = self.config.get("energy_regulator_vnext") or {}
+        collector = contract.get("collector") or {}
+        if not collector.get("enabled", False):
+            raise HACollectorError("site collector is disabled")
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            raise HACollectorError("SUPERVISOR_TOKEN is unavailable")
+        forecast = self.current_forecast()
+        if forecast is None:
+            raise HACollectorError("forecast is unavailable")
+        observed_at = collected_at or _iso(datetime.now(UTC))
+        runtime_config = copy.deepcopy(self.config)
+        runtime_collector = runtime_config["energy_regulator_vnext"]["collector"]
+        runtime_static = runtime_collector.setdefault("static", {})
+        checkpoint_options = (
+            (runtime_config.get("planning") or {}).get("soc_checkpoint") or {}
         )
+        runtime_static["checkpoint_at"] = next_soc_checkpoint(
+            forecast,
+            observed_at,
+            checkpoint_options.get("minutes_before_sunset", 60),
+        )
+        request = urllib.request.Request(
+            "http://supervisor/core/api/states",
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            states = json.load(response)
+        result = collect_regulator_inputs(runtime_config, states, observed_at)
+        result["runtime_site_config"] = runtime_config
+        result["forecast"] = forecast
+        return result
+
+    def refresh_actuals(self):
+        solar_energy = (
+            (self.config.get("measurements") or {}).get("solar_energy") or {}
+        )
+        statistic_ids = solar_energy.get("statistic_entities", [])
         if not statistic_ids:
             return
         token = os.environ.get("SUPERVISOR_TOKEN")
@@ -220,7 +442,9 @@ class ServiceState:
             "end_time": _iso(now),
             "period": "day",
             "types": ["change"],
-            "units": {},
+            # Recorder converts every energy statistic to one common unit,
+            # including sources whose native state is MWh.
+            "units": {"energy": "kWh"},
         }
         request = urllib.request.Request(
             (
@@ -254,29 +478,107 @@ class ServiceState:
                             .date()
                             .isoformat()
                         )
-                        change = max(0.0, float(point["change"]))
+                        change = float(point["change"])
+                        if not math.isfinite(change) or change < 0:
+                            continue
                     except (KeyError, TypeError, ValueError):
                         continue
                     if target_date >= today:
                         continue
                     day = by_date.setdefault(
-                        target_date, {"total": 0.0, "entities": {}}
+                        target_date, {"entities": {}}
                     )
-                    day["total"] += change
                     day["entities"][entity_id] = change
             observed_at = _iso(now)
+            quality = solar_energy.get("data_quality") or {}
+            require_all = quality.get("require_all_entities", True)
+            minimum_total = float(
+                quality.get("minimum_daily_total_kwh", 0.05)
+            )
+            maximum_specific_yield = float(
+                quality.get("maximum_daily_specific_yield_kwh_per_kwp", 8.0)
+            )
+            installed_capacity = sum(
+                float(item["capacity_kwp"]) for item in self.config["arrays"]
+            )
+            maximum_total = installed_capacity * maximum_specific_yield
+            accepted = 0
+            accepted_dates = set()
+            rejected = {}
             for target_date, item in by_date.items():
+                missing = [
+                    entity_id
+                    for entity_id in statistic_ids
+                    if entity_id not in item["entities"]
+                ]
+                total = sum(item["entities"].values())
+                reasons = []
+                if require_all and missing:
+                    reasons.append("missing_entities")
+                if total < minimum_total:
+                    reasons.append("daily_total_below_minimum")
+                if total > maximum_total:
+                    reasons.append("daily_specific_yield_above_maximum")
+                if reasons:
+                    rejected[target_date] = {
+                        "reasons": reasons,
+                        "missing_entities": missing,
+                        "total_kwh": total,
+                        "maximum_daily_total_kwh": maximum_total,
+                    }
+                    continue
                 self.history.append_actual(
                     self.config["site"]["id"],
                     target_date,
-                    item["total"],
+                    total,
                     "home_assistant_recorder_statistics",
-                    details={"entities_kwh": item["entities"]},
+                    details={
+                        "entities_kwh": item["entities"],
+                        **_measurement_source_details(
+                            statistic_ids,
+                            aggregation=solar_energy.get("aggregation", "sum"),
+                            normalized_unit="kWh",
+                        ),
+                        "quality_valid": True,
+                        "quality_rules": {
+                            "require_all_entities": bool(require_all),
+                            "minimum_daily_total_kwh": minimum_total,
+                            "maximum_daily_specific_yield_kwh_per_kwp": (
+                                maximum_specific_yield
+                            ),
+                            "maximum_daily_total_kwh": maximum_total,
+                        },
+                    },
                     observed_at=observed_at,
                 )
-            self.last_empirical_success_at = observed_at
-            self.last_empirical_error = None
-            LOG.info("Empirical production updated: days=%s", len(by_date))
+                accepted += 1
+                accepted_dates.add(target_date)
+            latest_completed_date = (
+                datetime.now(zone).date() - timedelta(days=1)
+            ).isoformat()
+            quality_messages = []
+            if accepted == 0:
+                quality_messages.append("no complete empirical day was accepted")
+            if latest_completed_date not in accepted_dates:
+                quality_messages.append(
+                    f"latest completed day {latest_completed_date} is unavailable"
+                )
+            if rejected:
+                recent_rejected = dict(sorted(rejected.items(), reverse=True)[:10])
+                quality_messages.append(
+                    f"rejected {len(rejected)} day(s): "
+                    + json.dumps(recent_rejected, sort_keys=True)
+                )
+            if latest_completed_date in accepted_dates:
+                self.last_empirical_success_at = observed_at
+            self.last_empirical_error = (
+                "; ".join(quality_messages) if quality_messages else None
+            )
+            LOG.info(
+                "Empirical production updated: accepted=%s rejected=%s",
+                accepted,
+                len(rejected),
+            )
         except Exception as exc:
             self.last_empirical_error = str(exc)
             LOG.warning("Empirical production refresh failed: %s", exc)
@@ -284,11 +586,10 @@ class ServiceState:
     def refresh_hourly_actuals(self):
         """Capture hourly PV energy and outdoor temperature from HA Recorder."""
         measurements = self.config.get("measurements") or {}
+        solar_energy = measurements.get("solar_energy") or {}
         solar_ids = (
-            (measurements.get("solar_energy") or {}).get(
-                "statistic_entities", []
-            )
-            or (measurements.get("solar_energy") or {}).get("entities", [])
+            solar_energy.get("statistic_entities", [])
+            or solar_energy.get("entities", [])
         )
         temperature_id = measurements.get(
             "outdoor_temperature_statistic_entity"
@@ -315,7 +616,7 @@ class ServiceState:
             "end_time": _iso(now),
             "period": "hour",
             "types": ["change", "mean"],
-            "units": {},
+            "units": {"energy": "kWh", "temperature": "°C"},
         }
         request = urllib.request.Request(
             (
@@ -342,7 +643,9 @@ class ServiceState:
                                 str(point["start"]).replace("Z", "+00:00")
                             )
                         )
-                        change = max(0.0, float(point["change"]))
+                        change = float(point["change"])
+                        if not math.isfinite(change) or change < 0:
+                            continue
                     except (KeyError, TypeError, ValueError):
                         continue
                     if _parse_utc(target_time) + timedelta(hours=1) > now:
@@ -371,13 +674,34 @@ class ServiceState:
                     item["temperature_c"] = temperature
             observed_at = _iso(now)
             for target_time, item in by_time.items():
+                missing = [
+                    entity_id
+                    for entity_id in solar_ids
+                    if entity_id not in item["entities"]
+                ]
+                pv_value = item["pv_kwh"]
+                if missing:
+                    pv_value = None
+                if pv_value is not None and pv_value <= 0:
+                    pv_value = None
+                if pv_value is None and item["temperature_c"] is None:
+                    continue
                 self.history.append_hourly_actual(
                     self.config["site"]["id"],
                     target_time,
-                    actual_pv_kwh=item["pv_kwh"],
+                    actual_pv_kwh=pv_value,
                     actual_temperature_c=item["temperature_c"],
                     source="home_assistant_recorder_hourly_statistics",
-                    details={"solar_entities_kwh": item["entities"]},
+                    details={
+                        "solar_entities_kwh": item["entities"],
+                        **_measurement_source_details(
+                            solar_ids,
+                            aggregation=solar_energy.get("aggregation", "sum"),
+                            normalized_unit="kWh",
+                        ),
+                        "quality_valid": not missing and pv_value is not None,
+                        "missing_entities": missing,
+                    },
                     observed_at=observed_at,
                 )
             LOG.info("Hourly empirical observations updated: hours=%s", len(by_time))
@@ -430,12 +754,39 @@ class ServiceState:
                 raise ValueError(
                     "daily actual_kwh_total must be finite and non-negative"
                 )
+            details = item.get("details") or {}
+            minimum_daily = float(
+                (((self.config.get("measurements") or {}).get("solar_energy") or {})
+                 .get("data_quality") or {})
+                .get("minimum_daily_total_kwh", 0.05)
+            )
+            maximum_specific_yield = float(
+                (((self.config.get("measurements") or {}).get("solar_energy") or {})
+                 .get("data_quality") or {})
+                .get("maximum_daily_specific_yield_kwh_per_kwp", 8.0)
+            )
+            maximum_daily = maximum_specific_yield * sum(
+                float(row["capacity_kwp"]) for row in self.config["arrays"]
+            )
+            if actual < minimum_daily and not details.get(
+                "confirmed_zero_production"
+            ):
+                raise ValueError(
+                    "daily actual below quality minimum; set "
+                    "details.confirmed_zero_production=true only for a "
+                    "verified real zero-production day"
+                )
+            if actual > maximum_daily:
+                raise ValueError(
+                    "daily actual exceeds the configured physical specific-yield "
+                    "limit"
+                )
             _, inserted = self.history.append_actual(
                 site_id,
                 target_date,
                 actual,
                 source,
-                details=item.get("details") or {},
+                details=details,
                 observed_at=str(observed_at),
             )
             result["daily_inserted"] += int(inserted)
@@ -522,6 +873,9 @@ class ServiceState:
                 "active_calibration": self.history.active_calibration(
                     self.config["site"]["id"]
                 ),
+                "empirical_exclusions": self.history.exclusion_summary(
+                    self.config["site"]["id"]
+                ),
             }
 
     def current_forecast(self):
@@ -555,6 +909,65 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self._json(forecast)
+            return
+        if path == "/api/regulator/history":
+            site_id = _first(
+                query, "site_id", self.server.state.config["site"]["id"]
+            )
+            limit = _integer(_first(query, "limit", "200"), 200, 1, 5000)
+            rows = self.server.state.history.list_regulator_plans(
+                site_id, limit=limit
+            )
+            self._json(
+                {
+                    "site_id": site_id,
+                    "count": len(rows),
+                    "append_only": True,
+                    "plans": rows,
+                }
+            )
+            return
+        if path == "/api/regulator/replay":
+            decision_id = _first(query, "decision_id")
+            if not decision_id:
+                self._json({"error": "decision_id_required"}, 400)
+                return
+            stored = self.server.state.history.regulator_plan(decision_id)
+            if stored is None:
+                self._json({"error": "regulator_plan_not_found"}, 404)
+                return
+            inputs = stored["input"]
+            try:
+                replayed = build_observation_plan(
+                    inputs["site_config"],
+                    inputs["forecast"],
+                    inputs["snapshot"],
+                    inputs["prices"],
+                )
+            except (KeyError, TypeError, ValueError, RegulatorInputError) as exc:
+                self._json(
+                    {
+                        "decision_id": decision_id,
+                        "replay_matches": False,
+                        "error": "stored_regulator_input_invalid",
+                        "message": str(exc),
+                    },
+                    500,
+                )
+                return
+            matches = replayed == stored["plan"]
+            self._json(
+                {
+                    "decision_id": decision_id,
+                    "site_id": stored["site_id"],
+                    "input_fingerprint": stored["input_fingerprint"],
+                    "stored_plan_version": stored["plan_version"],
+                    "replayed_plan_version": replayed["plan_version"],
+                    "replay_matches": matches,
+                    "actuation_authorized": False,
+                },
+                200 if matches else 409,
+            )
             return
         if path == "/api/history":
             target_date = _first(query, "target_date")
@@ -602,6 +1015,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "count": len(comparisons),
                     "metrics": self.server.state.history.empirical_metrics(
                         site_id, timezone_name, limit
+                    ),
+                    "exclusions": self.server.state.history.exclusion_summary(
+                        site_id
                     ),
                     "days": comparisons,
                 }
@@ -661,6 +1077,130 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(result, 201)
+            return
+        if path == "/api/regulator/collect-plan":
+            try:
+                collected = self.server.state.collect_regulator_observation()
+                result = build_observation_plan(
+                    collected["runtime_site_config"],
+                    collected["forecast"],
+                    collected["snapshot"],
+                    collected["prices"],
+                )
+                input_bundle = {
+                    "site_config": collected["runtime_site_config"],
+                    "forecast": collected["forecast"],
+                    "snapshot": collected["snapshot"],
+                    "prices": collected["prices"],
+                }
+                decision_id, inserted = (
+                    self.server.state.history.append_regulator_plan(
+                        result, input_bundle
+                    )
+                )
+            except (HACollectorError, RegulatorInputError, TypeError, ValueError) as exc:
+                self._json(
+                    {
+                        "error": "regulator_collection_failed",
+                        "message": str(exc),
+                        "actuation_authorized": False,
+                    },
+                    409,
+                )
+                return
+            except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+                self._json(
+                    {
+                        "error": "home_assistant_read_failed",
+                        "message": str(exc),
+                        "actuation_authorized": False,
+                    },
+                    503,
+                )
+                return
+            response = dict(result)
+            response["collector"] = {
+                "schema": collected["snapshot"]["schema"],
+                "source_fingerprint": collected["snapshot"]["source_fingerprint"],
+                "price_quality": collected["price_quality"],
+                "read_only": True,
+                "ha_service_calls": 0,
+            }
+            response["snapshot_storage"] = {
+                "decision_id": decision_id,
+                "inserted": inserted,
+                "database": "forecast-history.sqlite",
+                "append_only": True,
+                "replay_endpoint": f"/api/regulator/replay?decision_id={decision_id}",
+            }
+            self._json(response, 200)
+            return
+        if path == "/api/regulator/plan":
+            contract = self.server.state.config.get("energy_regulator_vnext")
+            if not isinstance(contract, dict):
+                self._json(
+                    {
+                        "error": "regulator_contract_not_configured",
+                        "actuation_authorized": False,
+                    },
+                    409,
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 5 * 1024 * 1024:
+                    raise ValueError("invalid Content-Length")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                forecast = self.server.state.current_forecast()
+                if forecast is None:
+                    self._json(
+                        {
+                            "error": "forecast_unavailable",
+                            "actuation_authorized": False,
+                        },
+                        503,
+                    )
+                    return
+                result = build_observation_plan(
+                    self.server.state.config,
+                    forecast,
+                    payload.get("snapshot") or {},
+                    payload.get("prices") or [],
+                )
+            except (json.JSONDecodeError, TypeError, ValueError, RegulatorInputError) as exc:
+                self._json(
+                    {
+                        "error": "invalid_regulator_input",
+                        "message": str(exc),
+                        "actuation_authorized": False,
+                    },
+                    400,
+                )
+                return
+            input_bundle = {
+                "site_config": self.server.state.config,
+                "forecast": forecast,
+                "snapshot": payload.get("snapshot") or {},
+                "prices": payload.get("prices") or [],
+            }
+            decision_id, inserted = (
+                self.server.state.history.append_regulator_plan(
+                    result, input_bundle
+                )
+            )
+            response = dict(result)
+            response["snapshot_storage"] = {
+                "decision_id": decision_id,
+                "inserted": inserted,
+                "database": "forecast-history.sqlite",
+                "append_only": True,
+                "replay_endpoint": (
+                    f"/api/regulator/replay?decision_id={decision_id}"
+                ),
+            }
+            self._json(response, 200)
             return
         self._json({"error": "not_found", "path": path}, 404)
 
@@ -767,8 +1307,15 @@ def _dashboard_html(state):
         if status["last_error"]
         else ""
     )
+    status_key = "running" if status["forecast_available"] else "waiting"
+    hourly_day = (
+        _escape(hourly_result.get("target_date"))
+        if hourly_result.get("target_date")
+        else '<span data-i18n="noCompletedDay">Ingen avsluttet dag</span>'
+    )
+    translations_json = json.dumps(DASHBOARD_TRANSLATIONS, ensure_ascii=False)
     return f"""<!doctype html>
-<html lang="en">
+<html lang="no">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -786,49 +1333,75 @@ def _dashboard_html(state):
     .positive {{ color:#7ee787; }} .negative {{ color:#ff7b72; }}
     h2 {{ margin-top:32px; }}
     a {{ color:#78c7ff; }}
+    .toolbar {{ display:flex; justify-content:flex-end; align-items:center; gap:8px; }}
+    select {{ padding:7px 10px; border-radius:8px; }}
   </style>
 </head>
 <body><main>
+  <div class="toolbar"><label for="language" data-i18n="language">Språk</label>
+    <select id="language">
+      <option value="no">Norsk</option><option value="en">English</option>
+      <option value="pt">Português</option><option value="es">Español</option>
+      <option value="uk">Українська</option><option value="de">Deutsch</option>
+    </select>
+  </div>
   <h1>Local Solar Forecast</h1>
   <p class="{'ok' if status['ok'] else 'error'}">
-    {'Running / Kjører' if status['forecast_available'] else 'Waiting / Venter'}
+    <span data-i18n="{status_key}">{'Kjører' if status['forecast_available'] else 'Venter'}</span>
   </p>
   {error}
   <section class="cards">
-    <div class="card">Site / Anlegg<div class="value">{_escape(status['site_id'])}</div></div>
-    <div class="card">Forecast / Prognose<div class="value">{summary.get('expected_kwh_total', '–')} kWh</div></div>
-    <div class="card">Model / Modell<div class="value">{MODEL_VERSION}</div></div>
-    <div class="card">Empirical days / Empiridøgn<div class="value">{metrics['days']}</div></div>
+    <div class="card"><span data-i18n="site">Anlegg</span><div class="value">{_escape(status['site_id'])}</div></div>
+    <div class="card"><span data-i18n="forecast">Prognose</span><div class="value">{summary.get('expected_kwh_total', '–')} kWh</div></div>
+    <div class="card"><span data-i18n="model">Modell</span><div class="value">{MODEL_VERSION}</div></div>
+    <div class="card"><span data-i18n="empiricalDays">Empiridøgn</span><div class="value">{metrics['days']}</div></div>
     <div class="card">MAE<div class="value">{_number(metrics['mae_kwh'])} kWh</div></div>
     <div class="card">Bias<div class="value">{_signed_number(metrics['bias_kwh'])} kWh</div></div>
   </section>
-  <h2>Forecast ahead / Prognose fremover</h2>
+  <h2 data-i18n="forecastAhead">Prognose fremover</h2>
   <table>
-    <thead><tr><th>Date / Dato</th><th>kWh</th><th>Weather / Vær</th><th>Horizon h</th></tr></thead>
+    <thead><tr><th data-i18n="date">Dato</th><th>kWh</th><th data-i18n="weather">Vær</th><th data-i18n="hoursAhead">Timer frem</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
-  <h2>Forecast versus actual / Prognose mot faktisk</h2>
-  <p>Fast comparison: latest forecast at or before 18:00 the previous day.</p>
+  <h2 data-i18n="forecastVsActual">Prognose mot faktisk</h2>
+  <p data-i18n="fixedComparison">Fast sammenligning: siste prognose kl. 18 eller tidligere dagen før.</p>
   <table>
-    <thead><tr><th>Date / Dato</th><th>Forecast / Prognose</th>
-      <th>Actual / Faktisk</th><th>Deviation kWh / Avvik</th>
-      <th>Deviation % / Avvik</th><th>Issued / Utstedt</th></tr></thead>
+    <thead><tr><th data-i18n="date">Dato</th><th data-i18n="forecast">Prognose</th>
+      <th data-i18n="actual">Faktisk</th><th data-i18n="deviationKwh">Avvik kWh</th>
+      <th data-i18n="deviationPercent">Avvik %</th><th data-i18n="issued">Utstedt</th></tr></thead>
     <tbody>{empirical_rows}</tbody>
   </table>
-  <h2>Hourly daylight verification / Timevis dagslysverifikasjon</h2>
-  <p>{_escape(hourly_result.get('target_date') or 'No completed day / Ingen avsluttet dag')}</p>
+  <h2 data-i18n="hourlyVerification">Timevis dagslysverifikasjon</h2>
+  <p>{hourly_day}</p>
   <table>
-    <thead><tr><th>Target / Måltime</th><th>Forecast kWh</th>
-      <th>Actual kWh</th><th>Deviation kWh</th><th>Cloud %</th>
-      <th>Forecast °C</th><th>Actual °C</th><th>Lead h</th>
-      <th>Source / Kilde</th></tr></thead>
+    <thead><tr><th data-i18n="target">Måltime</th><th><span data-i18n="forecast">Prognose</span> kWh</th>
+      <th><span data-i18n="actual">Faktisk</span> kWh</th><th data-i18n="deviationKwh">Avvik kWh</th><th data-i18n="cloud">Skydekke %</th>
+      <th data-i18n="forecastTemp">Prognose °C</th><th data-i18n="actualTemp">Faktisk °C</th><th data-i18n="hoursAhead">Timer frem</th>
+      <th data-i18n="source">Kilde</th></tr></thead>
     <tbody>{hourly_rows}</tbody>
   </table>
   <p><a href="./api/forecast">JSON API</a> ·
-    <a href="./api/history">Snapshots / Prognosehistorikk</a> ·
-    <a href="./api/empirics">Empirics / Empiri</a> ·
-    <a href="./api/hourly-comparison?target_date={_escape(hourly_result.get('target_date') or '')}">Hourly / Timevis</a></p>
-</main></body></html>"""
+    <a href="./api/history" data-i18n="snapshots">Prognosehistorikk</a> ·
+    <a href="./api/empirics" data-i18n="empirics">Empiri</a> ·
+    <a href="./api/hourly-comparison?target_date={_escape(hourly_result.get('target_date') or '')}" data-i18n="hourly">Timevis</a></p>
+</main>
+<script>
+  const translations = {translations_json};
+  const selector = document.getElementById("language");
+  function setLanguage(language) {{
+    const selected = translations[language] ? language : "no";
+    document.documentElement.lang = selected;
+    selector.value = selected;
+    document.querySelectorAll("[data-i18n]").forEach(element => {{
+      const value = translations[selected][element.dataset.i18n];
+      if (value !== undefined) element.textContent = value;
+    }});
+    localStorage.setItem("lsf-language", selected);
+  }}
+  selector.addEventListener("change", event => setLanguage(event.target.value));
+  setLanguage(localStorage.getItem("lsf-language") || "no");
+</script>
+</body></html>"""
 
 
 def _escape(value):
@@ -864,6 +1437,22 @@ def _find_statistics(value, statistic_ids):
         if found:
             return found
     return {}
+
+
+def _measurement_source_details(entity_ids, aggregation, normalized_unit):
+    """Return a stable, non-secret fingerprint for an empirical source set."""
+    source = {
+        "entity_ids": sorted(str(item) for item in entity_ids),
+        "aggregation": str(aggregation),
+        "normalized_unit": str(normalized_unit),
+    }
+    canonical = json.dumps(
+        source, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return {
+        "measurement_source": source,
+        "measurement_source_fingerprint": hashlib.sha256(canonical).hexdigest(),
+    }
 
 
 def _number(value):

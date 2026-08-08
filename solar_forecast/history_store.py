@@ -119,6 +119,19 @@ class ForecastHistory:
                 CREATE INDEX IF NOT EXISTS idx_hourly_actual_target
                 ON hourly_actual_observations(site_id, target_time, observed_at);
 
+                CREATE TABLE IF NOT EXISTS observation_exclusions (
+                    observation_type TEXT NOT NULL,
+                    observation_id TEXT NOT NULL,
+                    site_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    excluded_at TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    PRIMARY KEY (observation_type, observation_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_observation_exclusion_site
+                ON observation_exclusions(site_id, observation_type, excluded_at);
+
                 CREATE TABLE IF NOT EXISTS raw_forecast_payloads (
                     raw_payload_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
@@ -153,6 +166,22 @@ class ForecastHistory:
 
                 CREATE INDEX IF NOT EXISTS idx_calibration_site
                 ON model_calibrations(site_id, fitted_at, accepted);
+
+                CREATE TABLE IF NOT EXISTS regulator_plans (
+                    decision_id TEXT PRIMARY KEY,
+                    site_id TEXT NOT NULL,
+                    calculated_at TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    plan_version TEXT NOT NULL,
+                    input_fingerprint TEXT NOT NULL,
+                    forecast_issued_at TEXT NOT NULL,
+                    input_json TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_regulator_plan_site
+                ON regulator_plans(site_id, calculated_at);
                 """
             )
             self._ensure_column(
@@ -173,6 +202,7 @@ class ForecastHistory:
                 "source",
                 "TEXT NOT NULL DEFAULT 'unknown'",
             )
+            self._install_immutability_triggers(connection)
 
     @staticmethod
     def _ensure_column(connection, table, column, declaration):
@@ -184,6 +214,123 @@ class ForecastHistory:
             connection.execute(
                 f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
             )
+
+    @staticmethod
+    def _install_immutability_triggers(connection):
+        """Make historical source tables append-only at the SQLite layer."""
+        immutable_tables = (
+            "forecast_runs",
+            "daily_forecasts",
+            "hourly_forecasts",
+            "raw_forecast_payloads",
+            "actual_observations",
+            "hourly_actual_observations",
+            "model_calibrations",
+            "regulator_plans",
+        )
+        for table in immutable_tables:
+            for operation in ("UPDATE", "DELETE"):
+                trigger = f"prevent_{operation.lower()}_{table}"
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger}
+                    BEFORE {operation} ON {table}
+                    BEGIN
+                        SELECT RAISE(ABORT, '{table} is append-only');
+                    END
+                    """
+                )
+
+    def append_regulator_plan(self, plan, input_bundle):
+        """Append one reproducible regulator decision without overwriting."""
+        input_json = json.dumps(
+            input_bundle,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        plan_json = json.dumps(
+            plan,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        with self._connect() as connection:
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO regulator_plans (
+                    decision_id, site_id, calculated_at, schema_version,
+                    plan_version, input_fingerprint, forecast_issued_at,
+                    input_json, plan_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan["decision_id"],
+                    plan["site_id"],
+                    plan["calculated_at"],
+                    plan["schema_version"],
+                    plan["plan_version"],
+                    plan["input_fingerprint"],
+                    plan["forecast_issued_at"],
+                    input_json,
+                    plan_json,
+                    created_at,
+                ),
+            ).rowcount
+            if not inserted:
+                existing = connection.execute(
+                    """
+                    SELECT input_json, plan_json
+                    FROM regulator_plans
+                    WHERE decision_id = ?
+                    """,
+                    (plan["decision_id"],),
+                ).fetchone()
+                if (
+                    existing is None
+                    or existing["input_json"] != input_json
+                    or existing["plan_json"] != plan_json
+                ):
+                    raise ValueError(
+                        "regulator decision_id collision with different payload"
+                    )
+        return plan["decision_id"], bool(inserted)
+
+    def regulator_plan(self, decision_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT decision_id, site_id, calculated_at, schema_version,
+                       plan_version, input_fingerprint, forecast_issued_at,
+                       input_json, plan_json, created_at
+                FROM regulator_plans
+                WHERE decision_id = ?
+                """,
+                (decision_id,),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["input"] = json.loads(result.pop("input_json"))
+        result["plan"] = json.loads(result.pop("plan_json"))
+        return result
+
+    def list_regulator_plans(self, site_id, limit=200):
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT decision_id, site_id, calculated_at, schema_version,
+                       plan_version, input_fingerprint, forecast_issued_at,
+                       created_at
+                FROM regulator_plans
+                WHERE site_id = ?
+                ORDER BY calculated_at DESC, decision_id DESC
+                LIMIT ?
+                """,
+                (site_id, max(1, min(int(limit), 5000))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def append(self, forecast, raw_source=None):
         summary = forecast["forecast_summary"]
@@ -523,11 +670,17 @@ class ForecastHistory:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT observation_id, site_id, target_date, actual_kwh_total,
-                       source, details_json, observed_at
-                FROM actual_observations
-                WHERE site_id = ?
-                ORDER BY target_date DESC, observed_at DESC
+                SELECT a.observation_id, a.site_id, a.target_date,
+                       a.actual_kwh_total, a.source, a.details_json,
+                       a.observed_at
+                FROM actual_observations AS a
+                WHERE a.site_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM observation_exclusions AS e
+                    WHERE e.observation_type = 'daily'
+                      AND e.observation_id = a.observation_id
+                  )
+                ORDER BY a.target_date DESC, a.observed_at DESC
                 """,
                 (site_id,),
             ).fetchall()
@@ -538,6 +691,127 @@ class ForecastHistory:
                 item["details"] = json.loads(item.pop("details_json"))
                 latest[row["target_date"]] = item
         return list(latest.values())[: max(1, min(int(limit), 5000))]
+
+    def audit_daily_actuals(
+        self, site_id, zero_threshold_kwh=0.05, maximum_daily_kwh=None
+    ):
+        """Return suspicious immutable daily observations without changing them."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT a.*, e.reason AS exclusion_reason,
+                       e.excluded_at AS excluded_at
+                FROM actual_observations AS a
+                LEFT JOIN observation_exclusions AS e
+                  ON e.observation_type = 'daily'
+                 AND e.observation_id = a.observation_id
+                WHERE a.site_id = ?
+                ORDER BY a.target_date DESC, a.observed_at DESC
+                """,
+                (site_id,),
+            ).fetchall()
+        findings = []
+        for row in rows:
+            details = json.loads(row["details_json"])
+            reasons = []
+            if float(row["actual_kwh_total"]) < float(zero_threshold_kwh):
+                reasons.append("daily_total_below_minimum")
+            if (
+                maximum_daily_kwh is not None
+                and float(row["actual_kwh_total"]) > float(maximum_daily_kwh)
+            ):
+                reasons.append("daily_specific_yield_above_maximum")
+            if details.get("quality_valid") is False:
+                reasons.append("source_marked_quality_invalid")
+            if details.get("missing_entities"):
+                reasons.append("missing_entities")
+            if reasons or row["exclusion_reason"]:
+                findings.append(
+                    {
+                        "observation_id": row["observation_id"],
+                        "target_date": row["target_date"],
+                        "actual_kwh_total": float(row["actual_kwh_total"]),
+                        "source": row["source"],
+                        "observed_at": row["observed_at"],
+                        "reasons": sorted(set(reasons)),
+                        "excluded": row["exclusion_reason"] is not None,
+                        "exclusion_reason": row["exclusion_reason"],
+                        "excluded_at": row["excluded_at"],
+                    }
+                )
+        return findings
+
+    def exclude_observations(
+        self,
+        site_id,
+        observation_type,
+        observation_ids,
+        reason,
+        details=None,
+        excluded_at=None,
+    ):
+        """Reversibly quarantine observations while preserving raw rows."""
+        if observation_type not in {"daily", "hourly"}:
+            raise ValueError("observation_type must be daily or hourly")
+        reason = str(reason).strip()
+        if not reason:
+            raise ValueError("reason is required")
+        table = (
+            "actual_observations"
+            if observation_type == "daily"
+            else "hourly_actual_observations"
+        )
+        excluded_at = excluded_at or datetime.now(UTC).isoformat().replace(
+            "+00:00", "Z"
+        )
+        inserted = 0
+        missing = []
+        with self._connect() as connection:
+            for observation_id in sorted(set(observation_ids)):
+                exists = connection.execute(
+                    f"SELECT 1 FROM {table} WHERE observation_id = ? AND site_id = ?",
+                    (observation_id, site_id),
+                ).fetchone()
+                if not exists:
+                    missing.append(observation_id)
+                    continue
+                inserted += connection.execute(
+                    """
+                    INSERT OR IGNORE INTO observation_exclusions (
+                        observation_type, observation_id, site_id, reason,
+                        excluded_at, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        observation_type,
+                        observation_id,
+                        site_id,
+                        reason,
+                        excluded_at,
+                        json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                    ),
+                ).rowcount
+        return {"inserted": inserted, "missing": missing}
+
+    def exclusion_summary(self, site_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT observation_type, reason, COUNT(*) AS count,
+                       MIN(excluded_at) AS first_excluded_at,
+                       MAX(excluded_at) AS last_excluded_at
+                FROM observation_exclusions
+                WHERE site_id = ?
+                GROUP BY observation_type, reason
+                ORDER BY observation_type, reason
+                """,
+                (site_id,),
+            ).fetchall()
+        groups = [dict(row) for row in rows]
+        return {
+            "total": sum(row["count"] for row in groups),
+            "groups": groups,
+        }
 
     def append_hourly_actual(
         self,
@@ -659,10 +933,15 @@ class ForecastHistory:
         with self._connect() as connection:
             actual_rows = connection.execute(
                 """
-                SELECT *
-                FROM hourly_actual_observations
-                WHERE site_id = ? AND target_time >= ? AND target_time < ?
-                ORDER BY target_time ASC, observed_at DESC
+                SELECT a.*
+                FROM hourly_actual_observations AS a
+                WHERE a.site_id = ? AND a.target_time >= ? AND a.target_time < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM observation_exclusions AS e
+                    WHERE e.observation_type = 'hourly'
+                      AND e.observation_id = a.observation_id
+                  )
+                ORDER BY a.target_time ASC, a.observed_at DESC
                 """,
                 (
                     site_id,
@@ -688,6 +967,9 @@ class ForecastHistory:
                 forecast["target_time"]
             ).isoformat().replace("+00:00", "Z")
             actual = actual_by_time.get(normalized)
+            actual_details = (
+                json.loads(actual["details_json"]) if actual else {}
+            )
             predicted = float(forecast["expected_kwh_total"])
             measured = (
                 None
@@ -743,6 +1025,12 @@ class ForecastHistory:
                     "issued_at_semantics": forecast["issued_at_semantics"],
                     "lead_hours": forecast["lead_hours"],
                     "actual_source": actual["source"] if actual else None,
+                    "actual_quality_valid": actual_details.get(
+                        "quality_valid"
+                    ),
+                    "actual_measurement_source_fingerprint": (
+                        actual_details.get("measurement_source_fingerprint")
+                    ),
                 }
             )
         return {
