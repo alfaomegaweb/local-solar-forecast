@@ -68,11 +68,12 @@ def collect_regulator_inputs(site_config, states, collected_at):
     )
     work_limit, work_state = _number_state(
         indexed, entities, "work_limit", observed, maximum_age, evidence,
-        allowed_units={"kW", ""}, return_state=True,
+        allowed_units={"kW", ""}, return_state=True, require_fresh=False,
     )
     absolute_limit = _number_state(
         indexed, entities, "absolute_import_limit", observed, maximum_age,
         evidence, allowed_units={"kW", ""}, minimum=0.000001,
+        require_fresh=False,
     )
 
     base_load_kw, load_source = _base_load(
@@ -189,7 +190,8 @@ def _index_states(states):
 
 def _number_state(indexed, entities, role, now, maximum_age, evidence,
                   allowed_units, minimum=None, maximum=None,
-                  convert_power_to_kw=False, return_state=False):
+                  convert_power_to_kw=False, return_state=False,
+                  require_fresh=True):
     entity_id = entities.get(role)
     if not entity_id:
         raise HACollectorError(f"collector entity role {role!r} is not configured")
@@ -203,7 +205,7 @@ def _number_state(indexed, entities, role, now, maximum_age, evidence,
     age = (now - timestamp).total_seconds()
     if age < -5:
         raise HACollectorError(f"required HA entity for {role} has a future timestamp")
-    if age > maximum_age:
+    if require_fresh and age > maximum_age:
         raise HACollectorError(f"required HA entity for {role} is stale ({int(age)} seconds)")
     attributes = state.get("attributes") or {}
     unit = str(attributes.get("unit_of_measurement") or "")
