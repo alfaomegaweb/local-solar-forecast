@@ -11,7 +11,7 @@ LABEL \
 RUN apk add --no-cache python3 py3-yaml
 
 WORKDIR /app
-COPY app.py forecast_engine.py history_store.py calibration.py regulator.py ha_collector.py /app/
+COPY app.py forecast_engine.py history_store.py calibration.py regulator.py ha_collector.py mqtt_proposal.py /app/
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
