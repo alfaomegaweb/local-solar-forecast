@@ -131,7 +131,7 @@ class ForecastEngineTests(unittest.TestCase):
     def test_candidate_package_can_be_verified_during_staged_rollout(self):
         result = verify_registry(PROJECT / "fleet" / "sites.yaml")
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual(result["package_config_version"], "0.5.3")
+        self.assertEqual(result["package_config_version"], "0.5.4")
 
     def test_canonical_fleet_profiles_are_valid_and_distinct(self):
         if addon_app.yaml is None:
