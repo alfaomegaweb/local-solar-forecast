@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4
+
+- Publish BB86 work-limit proposals through Home Assistant's MQTT service
+  without storing broker credentials in LSF.
+- Require the exact allowlisted topic `lsf/bb86/work_limit/proposal/`, QoS 1,
+  non-retained messages and short validity windows.
+- Keep dry-run as the generic default. Active proposals require BB86, an
+  explicit site authorization reference and `actuation_authorized: true`.
+- Add an opt-in background publisher using the configured regulator interval;
+  it remains disabled unless regulator, read-only collector and proposal MQTT
+  are all explicitly enabled.
+
 ## 0.5.3
 
 - Open the preserved import database in SQLite immutable mode so migration
@@ -25,6 +37,16 @@
 
 ## 0.6.0 draft
 
+- Add the accepted service-operations placeholder for the two installation
+  tracks, the mandatory 64-bit/robust-storage and remote-ready gates, explicit
+  customer consent, centrally measured Maplite reachability, separately
+  measured HA/LSF health, three-month included service lifecycle,
+  optional monthly/annual continuation, customer-optional updates and
+  fail-closed remote monitoring. This placeholder enables no telemetry,
+  billing, remote access or actuation by itself.
+- Add the notification contract for an unresolved service incident: at most
+  one SMS/e-mail per day for the first three notification days, followed by
+  one Saturday reminder until recovery or administrative closure.
 - Add the contract and generic site-template placeholder for evidence-based
   installation discovery and safe rediscovery after hardware, integration,
   entity, unit or source-regime changes. Discovery remains non-actuating and

@@ -30,6 +30,11 @@ from forecast_engine import MODEL_VERSION, build_forecast, validate_site_config
 from history_store import ForecastHistory
 from calibration import apply_calibration, fit_calibration
 from regulator import RegulatorInputError, build_observation_plan
+from mqtt_proposal import (
+    ProposalPublishError,
+    build_proposal,
+    publish_via_home_assistant,
+)
 from ha_collector import (
     HACollectorError,
     collect_regulator_inputs,
@@ -470,6 +475,64 @@ class ServiceState:
         result["runtime_site_config"] = runtime_config
         result["forecast"] = forecast
         return result
+
+    def collect_store_publish_regulator_plan(self):
+        """Collect, store and optionally publish one observation-only plan."""
+        collected = self.collect_regulator_observation()
+        result = build_observation_plan(
+            collected["runtime_site_config"],
+            collected["forecast"],
+            collected["snapshot"],
+            collected["prices"],
+        )
+        input_bundle = {
+            "site_config": collected["runtime_site_config"],
+            "forecast": collected["forecast"],
+            "snapshot": collected["snapshot"],
+            "prices": collected["prices"],
+        }
+        decision_id, inserted = self.history.append_regulator_plan(
+            result, input_bundle
+        )
+        response = dict(result)
+        response["collector"] = {
+            "schema": collected["snapshot"]["schema"],
+            "source_fingerprint": collected["snapshot"]["source_fingerprint"],
+            "price_quality": collected["price_quality"],
+            "read_only": True,
+            "ha_service_calls": 0,
+        }
+        response["snapshot_storage"] = {
+            "decision_id": decision_id,
+            "inserted": inserted,
+            "database": "forecast-history.sqlite",
+            "append_only": True,
+            "replay_endpoint": f"/api/regulator/replay?decision_id={decision_id}",
+        }
+        mqtt_options = (
+            (self.config.get("energy_regulator_vnext") or {}).get(
+                "proposal_mqtt"
+            ) or {}
+        )
+        if mqtt_options.get("enabled", False):
+            proposal = build_proposal(
+                result,
+                topic=mqtt_options.get(
+                    "topic", "lsf/bb86/work_limit/proposal/"
+                ),
+                valid_for_seconds=mqtt_options.get(
+                    "valid_for_seconds", 900
+                ),
+                mode=mqtt_options.get("mode", "dry_run"),
+                actuation_authorized=mqtt_options.get(
+                    "actuation_authorized", False
+                ),
+                authorization_ref=mqtt_options.get("authorization_ref"),
+            )
+            response["mqtt_proposal"] = publish_via_home_assistant(
+                proposal, os.environ.get("SUPERVISOR_TOKEN")
+            )
+        return response
 
     def refresh_actuals(self):
         solar_energy = (
@@ -1129,24 +1192,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/regulator/collect-plan":
             try:
-                collected = self.server.state.collect_regulator_observation()
-                result = build_observation_plan(
-                    collected["runtime_site_config"],
-                    collected["forecast"],
-                    collected["snapshot"],
-                    collected["prices"],
+                response = (
+                    self.server.state.collect_store_publish_regulator_plan()
                 )
-                input_bundle = {
-                    "site_config": collected["runtime_site_config"],
-                    "forecast": collected["forecast"],
-                    "snapshot": collected["snapshot"],
-                    "prices": collected["prices"],
-                }
-                decision_id, inserted = (
-                    self.server.state.history.append_regulator_plan(
-                        result, input_bundle
-                    )
+            except ProposalPublishError as exc:
+                LOG.error("MQTT work-limit proposal was not published: %s", exc)
+                self._json(
+                    {
+                        "error": "mqtt_proposal_publish_failed",
+                        "message": str(exc),
+                        "actuation_authorized": False,
+                    },
+                    503,
                 )
+                return
             except (HACollectorError, RegulatorInputError, TypeError, ValueError) as exc:
                 self._json(
                     {
@@ -1167,22 +1226,70 @@ class RequestHandler(BaseHTTPRequestHandler):
                     503,
                 )
                 return
-            response = dict(result)
-            response["collector"] = {
-                "schema": collected["snapshot"]["schema"],
-                "source_fingerprint": collected["snapshot"]["source_fingerprint"],
-                "price_quality": collected["price_quality"],
-                "read_only": True,
-                "ha_service_calls": 0,
-            }
-            response["snapshot_storage"] = {
-                "decision_id": decision_id,
-                "inserted": inserted,
-                "database": "forecast-history.sqlite",
-                "append_only": True,
-                "replay_endpoint": f"/api/regulator/replay?decision_id={decision_id}",
-            }
             self._json(response, 200)
+            return
+        if path == "/api/regulator/publish-proposal":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 64 * 1024:
+                    raise ValueError("invalid Content-Length")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                contract = self.server.state.config.get(
+                    "energy_regulator_vnext"
+                ) or {}
+                mqtt_options = contract.get("proposal_mqtt") or {}
+                if not mqtt_options.get("enabled", False):
+                    raise ProposalPublishError("proposal MQTT is disabled")
+                plan = {
+                    "site_id": "bb86",
+                    "decision_id": payload.get("decision_id"),
+                    "proposed_work_limit_kw": payload.get(
+                        "proposed_work_limit_kw"
+                    ),
+                    "reason": payload.get("reason"),
+                    "mode": "observe_only",
+                    "actuation_authorized": False,
+                }
+                proposal = build_proposal(
+                    plan,
+                    topic=mqtt_options.get(
+                        "topic", "lsf/bb86/work_limit/proposal/"
+                    ),
+                    valid_for_seconds=mqtt_options.get(
+                        "valid_for_seconds", 900
+                    ),
+                    mode=mqtt_options.get("mode", "dry_run"),
+                    actuation_authorized=mqtt_options.get(
+                        "actuation_authorized", False
+                    ),
+                    authorization_ref=mqtt_options.get("authorization_ref"),
+                )
+                result = publish_via_home_assistant(
+                    proposal, os.environ.get("SUPERVISOR_TOKEN")
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                self._json(
+                    {
+                        "error": "mqtt_proposal_rejected",
+                        "message": str(exc),
+                        "actuation_authorized": False,
+                    },
+                    400,
+                )
+                return
+            self._json(
+                {
+                    **result,
+                    "mode": mqtt_options.get("mode", "dry_run"),
+                    "dry_run": mqtt_options.get("mode", "dry_run") != "active",
+                    "actuation_authorized": mqtt_options.get(
+                        "mode", "dry_run"
+                    ) == "active",
+                },
+                200,
+            )
             return
         if path == "/api/regulator/plan":
             contract = self.server.state.config.get("energy_regulator_vnext")
@@ -1293,6 +1400,36 @@ def _background_loop(state):
         max(5, int(state.options["refresh_minutes"])) * 60
     ):
         state.refresh()
+
+
+def _regulator_background_loop(state):
+    contract = state.config.get("energy_regulator_vnext") or {}
+    collector = contract.get("collector") or {}
+    mqtt_options = contract.get("proposal_mqtt") or {}
+    if not (
+        contract.get("enabled", False)
+        and collector.get("enabled", False)
+        and mqtt_options.get("enabled", False)
+    ):
+        LOG.info("Automatic MQTT proposals are disabled by site configuration")
+        return
+    interval_minutes = int(contract.get("replan_interval_minutes", 15))
+    interval_seconds = max(5, interval_minutes) * 60
+    while not state.stop_event.is_set():
+        try:
+            published = state.collect_store_publish_regulator_plan()
+            mqtt_result = published.get("mqtt_proposal") or {}
+            LOG.info(
+                "MQTT work-limit proposal published: topic=%s decision=%s",
+                mqtt_result.get("topic"),
+                mqtt_result.get("decision_id"),
+            )
+        except Exception:
+            LOG.exception(
+                "Automatic observation-only MQTT proposal failed; no actuation performed"
+            )
+        if state.stop_event.wait(interval_seconds):
+            return
 
 
 def _dashboard_html(state):
@@ -1546,6 +1683,13 @@ def main():
         daemon=True,
     )
     worker.start()
+    regulator_worker = threading.Thread(
+        target=_regulator_background_loop,
+        args=(state,),
+        name="regulator-mqtt-proposal",
+        daemon=True,
+    )
+    regulator_worker.start()
     server = ForecastServer(
         ("0.0.0.0", int(options["listen_port"])),
         RequestHandler,

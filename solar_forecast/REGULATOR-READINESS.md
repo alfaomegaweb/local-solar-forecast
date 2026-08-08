@@ -11,6 +11,10 @@ Status: development source only. Not deployed as common fleet version.
 - Explicit Supervisor `GET /api/states` collection and dynamic SOC-KP derived
   from the first future forecast sunset; the endpoint remains disabled by each
   site's acceptance gate and has no service-call path.
+- Opt-in BB86 dry-run proposal publication through Home Assistant's MQTT
+  service, using the exact trailing-slash topic, QoS 1 and non-retained
+  messages. The background loop runs at the configured replanning interval
+  only when regulator, collector and publisher gates are all enabled.
 
 - Pure deterministic planner in `regulator.py`; no Home Assistant client or
   service-call code exists in the module.
@@ -77,7 +81,8 @@ Status: development source only. Not deployed as common fleet version.
 
 ## Current fleet truth
 
-- Common source/package version remains `0.5.0`.
+- Common source/package version remains `0.5.3`; `0.5.4` is the undeployed
+  candidate containing the MQTT proposal publisher.
 - BB86 is the approved active `work_limit` pilot, currently independent of the
   generic 0.6 planner actuator path.
 - The 0.6 planner is not yet an actuator and cannot change `work_limit`.

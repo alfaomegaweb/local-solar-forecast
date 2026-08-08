@@ -15,6 +15,21 @@ A rerun never overwrites an earlier run or historical observation. Hardware,
 integration, entity or unit changes create a new source regime after approval.
 Discovery and rediscovery are non-actuating.
 
+## Historical reconstruction contract placeholder
+
+`lsf-history-reconstruction/1` preserves every existing forecast run, daily
+and hourly forecast and raw provider payload. It appends reconstructed empirical
+observations from source regimes in an explicit site-defined priority order.
+Every accepted observation carries its source fingerprint, observation and
+availability times, confidence and—at hourly resolution—authoritative interval
+boundaries.
+
+Missing periods are emitted as gaps, never fabricated as zero production.
+Conflicting candidates are retained in reconstruction evidence with rejection
+reasons. Invalid legacy observations are preserved and reversibly excluded.
+The result reports daily/hourly coverage and whether each target period is safe
+for forecast-versus-actual comparison or model training.
+
 Status: owner decision, not yet implemented. This document does not alter the
 0.4.2 runtime contract.
 

@@ -42,12 +42,120 @@ from ha_collector import (  # noqa: E402
     collect_regulator_inputs,
     next_soc_checkpoint,
 )
+from mqtt_proposal import (  # noqa: E402
+    ProposalPublishError,
+    build_proposal,
+    publish_via_home_assistant,
+)
 from tools.rehearse_lsf_migration import rehearse  # noqa: E402
 from tools.verify_lsf_fleet import verify_registry  # noqa: E402
 import app as addon_app  # noqa: E402
 
 
 UTC = timezone.utc
+
+
+class MockHTTPResponse(io.BytesIO):
+    def __init__(self, body=b"[]", status=200):
+        super().__init__(body)
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class MQTTProposalTests(unittest.TestCase):
+    NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+
+    def plan(self):
+        return {
+            "site_id": "bb86",
+            "decision_id": "decision-123",
+            "proposed_work_limit_kw": -8.2,
+            "reason": "SOC-plan og prisgrunnlag",
+            "mode": "observe_only",
+            "actuation_authorized": False,
+        }
+
+    def test_builds_exact_dry_run_contract_with_trailing_slash(self):
+        proposal = build_proposal(self.plan(), now=self.NOW)
+        self.assertEqual(proposal["topic"], "lsf/bb86/work_limit/proposal/")
+        self.assertEqual(proposal["payload"]["issued_at"], "2026-08-08T12:00:00Z")
+        self.assertEqual(proposal["payload"]["valid_until"], "2026-08-08T12:15:00Z")
+        self.assertEqual(proposal["payload"]["proposed_work_limit_kw"], -8.2)
+        self.assertTrue(proposal["payload"]["dry_run"])
+        self.assertFalse(proposal["payload"]["actuation_authorized"])
+
+    def test_rejects_topic_without_trailing_slash(self):
+        with self.assertRaisesRegex(ProposalPublishError, "end with"):
+            build_proposal(
+                self.plan(), topic="lsf/bb86/work_limit/proposal", now=self.NOW
+            )
+
+    def test_builds_explicit_owner_authorized_active_bb86_contract(self):
+        proposal = build_proposal(
+            self.plan(),
+            now=self.NOW,
+            mode="active",
+            actuation_authorized=True,
+            authorization_ref="bb86-owner-approved-active-pilot-2026-08-08",
+        )
+        payload = proposal["payload"]
+        self.assertEqual(payload["mode"], "active")
+        self.assertFalse(payload["dry_run"])
+        self.assertTrue(payload["actuation_authorized"])
+        self.assertEqual(
+            payload["authorization_ref"],
+            "bb86-owner-approved-active-pilot-2026-08-08",
+        )
+
+    def test_active_contract_requires_authorization_and_reference(self):
+        with self.assertRaisesRegex(ProposalPublishError, "authorization"):
+            build_proposal(self.plan(), now=self.NOW, mode="active")
+        with self.assertRaisesRegex(ProposalPublishError, "authorization_ref"):
+            build_proposal(
+                self.plan(),
+                now=self.NOW,
+                mode="active",
+                actuation_authorized=True,
+            )
+
+    def test_rejects_non_observation_or_wrong_site(self):
+        active = self.plan()
+        active["actuation_authorized"] = True
+        with self.assertRaises(ProposalPublishError):
+            build_proposal(active, now=self.NOW)
+        wrong = self.plan()
+        wrong["site_id"] = "hf39"
+        with self.assertRaises(ProposalPublishError):
+            build_proposal(wrong, now=self.NOW)
+
+    def test_publishes_through_ha_mqtt_service_without_broker_credentials(self):
+        captured = {}
+
+        def opener(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return MockHTTPResponse(status=200)
+
+        result = publish_via_home_assistant(
+            build_proposal(self.plan(), now=self.NOW),
+            "test-supervisor-token",
+            opener=opener,
+        )
+        request = captured["request"]
+        body = json.loads(request.data)
+        payload = json.loads(body["payload"])
+        self.assertEqual(request.full_url, "http://supervisor/core/api/services/mqtt/publish")
+        self.assertEqual(body["topic"], "lsf/bb86/work_limit/proposal/")
+        self.assertEqual(body["qos"], 1)
+        self.assertFalse(body["retain"])
+        self.assertEqual(payload["decision_id"], "decision-123")
+        self.assertNotIn("test-supervisor-token", json.dumps(body))
+        self.assertTrue(result["published"])
 
 
 def sample_config(site_id="test_site"):
@@ -131,7 +239,7 @@ class ForecastEngineTests(unittest.TestCase):
     def test_candidate_package_can_be_verified_during_staged_rollout(self):
         result = verify_registry(PROJECT / "fleet" / "sites.yaml")
         self.assertTrue(result["passed"], result["errors"])
-        self.assertEqual(result["package_config_version"], "0.5.3")
+        self.assertEqual(result["package_config_version"], "0.5.4")
 
     def test_canonical_fleet_profiles_are_valid_and_distinct(self):
         if addon_app.yaml is None:

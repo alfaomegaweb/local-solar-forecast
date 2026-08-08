@@ -302,8 +302,26 @@ When enabled for an accepted site, `POST /api/regulator/collect-plan` performs
 exactly one Supervisor `GET /api/states`, derives the next SOC-KP as the
 configured number of minutes before the first future forecast sunset,
 normalizes the inputs, builds an observation-only plan and appends the complete
-input/output bundle to regulator history. It never calls an HA service and
-returns `actuation_authorized: false` through the planner contract.
+input/output bundle to regulator history. The collector and planner never
+actuate an entity and return `actuation_authorized: false`.
+
+If `energy_regulator_vnext.enabled`, `collector.enabled` and
+`proposal_mqtt.enabled` are all true, LSF also runs this operation at startup
+and then every `replan_interval_minutes` (15 minutes by default). The resulting
+short-lived proposal is published through Home Assistant's existing
+`mqtt.publish` service to the exact allowlisted topic
+`lsf/bb86/work_limit/proposal/`, with QoS 1 and retain disabled. LSF stores no
+MQTT broker password. A collection, validation or publish failure is logged
+and fails closed without actuation. Dry-run is the generic default. Active
+mode is accepted only for BB86 when the site profile carries both an explicit
+authorization reference and `actuation_authorized: true`; the customer-owned
+Node-RED gate remains the local actuator and emergency stop. The manual
+endpoint uses the same path.
+
+`POST /api/regulator/publish-proposal` is a narrow transition endpoint for an
+externally calculated BB86 proposal. It accepts only `decision_id`,
+`proposed_work_limit_kw` and `reason`, forces observation-only mode and uses
+the same allowlisted MQTT contract. It cannot call an actuator.
 
 ## Safe migration
 
