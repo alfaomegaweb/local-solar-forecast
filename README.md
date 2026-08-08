@@ -15,7 +15,7 @@ hourly and daily values, including totals per panel direction and array.
 
 1. In Home Assistant, open **Settings → Apps → App store**.
 2. Open **Repositories** and add:
-   `https://github.com/hovbjo99/local-solar-forecast`
+   `https://github.com/alfaomegaweb/local-solar-forecast`
 3. Install **Local Solar Forecast**.
 4. Copy `solar_forecast/site-template.yaml` to
    `/config/solar_forecast/site.yaml` and enter the site's geodata, PV arrays
