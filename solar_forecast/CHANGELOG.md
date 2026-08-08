@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.5
+
+- Treat Home Assistant `input_select` values for work limit and absolute
+  import limit as stable control configuration: validate their value, unit and
+  allowed options without expiring them merely because they have not changed.
+- Continue to fail closed when SOC, power measurements or other live telemetry
+  exceeds the configured maximum state age.
+
 ## 0.5.4
 
 - Publish BB86 work-limit proposals through Home Assistant's MQTT service

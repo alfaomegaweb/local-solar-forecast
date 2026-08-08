@@ -1179,6 +1179,25 @@ class HACollectorTests(unittest.TestCase):
                 self.config(), unavailable, self.NOW.isoformat()
             )
 
+    def test_stable_control_helpers_do_not_expire_when_values_remain_valid(self):
+        states = self.valid_states()
+        states[1] = self.state(
+            "input_select.deye_work_limit",
+            -0.25,
+            attributes={"options": ["-0.5", "-0.25", "0", "0.25", "4.7"]},
+            minutes_old=24 * 60,
+        )
+        states[2] = self.state(
+            "input_select.absolute_grid_limit", 4.7, minutes_old=24 * 60
+        )
+
+        result = collect_regulator_inputs(
+            self.config(), states, self.NOW.isoformat()
+        )
+
+        self.assertEqual(result["snapshot"]["observed_work_limit_kw"], -0.25)
+        self.assertEqual(result["snapshot"]["absolute_import_limit_kw"], 4.7)
+
     def test_entity_swap_changes_source_fingerprint(self):
         original = collect_regulator_inputs(
             self.config(), self.valid_states(), self.NOW.isoformat()
