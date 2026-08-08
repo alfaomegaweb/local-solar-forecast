@@ -60,6 +60,40 @@ initialization:
       discovery_completed_at: true
       approved_by: null
       approved_at: null
+  history_reconstruction:
+    enabled: true
+    mode: "proposal_only"
+    state: "not_run"
+    schema: "lsf-history-reconstruction/1"
+    preserve:
+      forecast_runs: true
+      daily_forecasts: true
+      hourly_forecasts: true
+      raw_forecast_payloads: true
+      existing_observations: true
+    empirical_source_priority:
+      - "local_modbus_long_term_statistics"
+      - "home_assistant_recorder_statistics"
+      - "vendor_export_csv"
+      - "legacy_cloud_statistics"
+    rules:
+      append_only: true
+      overwrite_existing_observations: false
+      invent_zero_for_missing_interval: false
+      require_source_fingerprint: true
+      require_interval_start_and_end_for_hourly: true
+      require_observed_at_and_available_at: true
+      separate_measurement_source_regimes: true
+      quarantine_invalid_legacy_rows_reversibly: true
+      record_gap_instead_of_value_when_unresolved: true
+    output:
+      coverage_by_day_and_hour: true
+      source_and_confidence_per_observation: true
+      unresolved_gaps: true
+      rejected_candidates_with_reason: true
+      forecast_actual_comparison_ready: true
+      reconstruction_started_at: true
+      reconstruction_completed_at: true
 
 site:
   id: "REPLACE_ME"

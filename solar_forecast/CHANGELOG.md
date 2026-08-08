@@ -16,6 +16,9 @@
   installation discovery and safe rediscovery after hardware, integration,
   entity, unit or source-regime changes. Discovery remains non-actuating and
   requires confirmation before a control mapping can change.
+- Add a historical-reconstruction placeholder that preserves all forecasts,
+  rebuilds empirical observations with source/interval provenance and records
+  unresolved periods as gaps instead of false zero production.
 
 - Add a generic, read-only Home Assistant state collector with strict
   timestamp/unit validation, live input-select options and fail-closed handling

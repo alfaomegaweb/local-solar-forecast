@@ -202,6 +202,21 @@ according to their dependency.
 This is a placeholder for the next add-on phase; automatic discovery runtime
 and its approval UI are not enabled in 0.5.1.
 
+### Historical reconstruction after discovery
+
+The same next phase includes `initialization.history_reconstruction`. Existing
+forecast snapshots and raw weather inputs are retained unchanged. Empirical PV
+production can then be rebuilt from local Modbus long-term statistics, Home
+Assistant Recorder, vendor CSV exports and legacy cloud statistics in a fixed
+site-defined priority order.
+
+Reconstruction appends observations with timestamps, interval boundaries,
+source fingerprints and confidence. It records unresolved periods as data gaps
+instead of inventing zero production. Conflicts and rejected values remain
+auditable, while invalid legacy rows are excluded reversibly. The resulting
+coverage report determines which days and hours may be used for comparison or
+learning.
+
 The first 0.6 draft now implements the deterministic calculation as a pure,
 non-actuating module. `POST /api/regulator/plan` accepts a timestamped battery,
 load and grid-limit snapshot plus Nord Pool intervals, combines these with the
