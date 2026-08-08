@@ -184,7 +184,11 @@ def import_history_database_once(source_path, destination_path):
     if not source_path or not source.is_file() or destination.exists():
         return {"imported": False, "reason": "not_requested_or_destination_exists"}
 
-    with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as connection:
+    # The Home Assistant /config mount is read-only inside the app. Immutable
+    # mode prevents SQLite from trying to create WAL/SHM sidecars there.
+    with sqlite3.connect(
+        f"file:{source}?mode=ro&immutable=1", uri=True
+    ) as connection:
         result = connection.execute("PRAGMA quick_check").fetchone()[0]
         if result != "ok":
             raise RuntimeError(f"History database import failed quick_check: {result}")
