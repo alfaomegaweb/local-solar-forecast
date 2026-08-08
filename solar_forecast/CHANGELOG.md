@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3
+
+- Open the preserved import database in SQLite immutable mode so migration
+  works from Home Assistant's read-only `/config` mount without WAL/SHM writes.
+
 ## 0.5.2
 
 - Add a fail-closed, one-time SQLite history import for migration between Home
