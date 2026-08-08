@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2
+
+- Add a fail-closed, one-time SQLite history import for migration between Home
+  Assistant app slugs. The source and copied database must pass `quick_check`,
+  and an existing destination is never overwritten.
+- Preserve all forecast snapshots and empirical rows during the HF39 migration;
+  data-quality exclusions remain additive and reversible.
+
 ## 0.5.1
 
 - Package the regulator and Home Assistant collector modules required by the
@@ -16,6 +24,9 @@
   installation discovery and safe rediscovery after hardware, integration,
   entity, unit or source-regime changes. Discovery remains non-actuating and
   requires confirmation before a control mapping can change.
+- Add a historical-reconstruction placeholder that preserves all forecasts,
+  rebuilds empirical observations with source/interval provenance and records
+  unresolved periods as gaps instead of false zero production.
 
 - Add a generic, read-only Home Assistant state collector with strict
   timestamp/unit validation, live input-select options and fail-closed handling

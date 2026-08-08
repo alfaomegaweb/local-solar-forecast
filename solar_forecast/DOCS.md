@@ -56,6 +56,12 @@ The forecast response keeps the fields used by the existing energy matrix:
 ## Forecast history
 
 The persistent database is `/data/forecast-history.sqlite` inside the app.
+
+For a controlled migration from an older app slug, place a verified copy in
+`/config/solar_forecast/` and set `history_database_import_path`. The database
+is copied only when `/data/forecast-history.sqlite` does not yet exist. Both
+source and copy must pass SQLite `quick_check`; an existing destination is
+never overwritten.
 Every run has a unique hash and is inserted without updating previous rows.
 There is no automatic history pruning. Raw provider responses are stored with
 a SHA-256 digest and non-secret request metadata.
@@ -201,6 +207,21 @@ according to their dependency.
 
 This is a placeholder for the next add-on phase; automatic discovery runtime
 and its approval UI are not enabled in 0.5.1.
+
+### Historical reconstruction after discovery
+
+The same next phase includes `initialization.history_reconstruction`. Existing
+forecast snapshots and raw weather inputs are retained unchanged. Empirical PV
+production can then be rebuilt from local Modbus long-term statistics, Home
+Assistant Recorder, vendor CSV exports and legacy cloud statistics in a fixed
+site-defined priority order.
+
+Reconstruction appends observations with timestamps, interval boundaries,
+source fingerprints and confidence. It records unresolved periods as data gaps
+instead of inventing zero production. Conflicts and rejected values remain
+auditable, while invalid legacy rows are excluded reversibly. The resulting
+coverage report determines which days and hours may be used for comparison or
+learning.
 
 The first 0.6 draft now implements the deterministic calculation as a pure,
 non-actuating module. `POST /api/regulator/plan` accepts a timestamped battery,

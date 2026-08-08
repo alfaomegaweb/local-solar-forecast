@@ -9,6 +9,8 @@ import json
 import logging
 import math
 import os
+import shutil
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -47,6 +49,7 @@ DEFAULT_OPTIONS = {
     "legacy_history_path": (
         "/config/solar_forecast/legacy-forecast-snapshots.ndjson"
     ),
+    "history_database_import_path": "",
 }
 
 DASHBOARD_TRANSLATIONS = {
@@ -174,6 +177,42 @@ def load_site_config(path):
     return validate_site_config(loaded)
 
 
+def import_history_database_once(source_path, destination_path):
+    """Safely seed an empty app data directory from a preserved SQLite DB."""
+    source = Path(str(source_path or ""))
+    destination = Path(destination_path)
+    if not source_path or not source.is_file() or destination.exists():
+        return {"imported": False, "reason": "not_requested_or_destination_exists"}
+
+    with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as connection:
+        result = connection.execute("PRAGMA quick_check").fetchone()[0]
+        if result != "ok":
+            raise RuntimeError(f"History database import failed quick_check: {result}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".importing")
+    if temporary.exists():
+        temporary.unlink()
+    shutil.copy2(source, temporary)
+    try:
+        with sqlite3.connect(temporary) as connection:
+            result = connection.execute("PRAGMA quick_check").fetchone()[0]
+            if result != "ok":
+                raise RuntimeError(
+                    f"Copied history database failed quick_check: {result}"
+                )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {
+        "imported": True,
+        "source": str(source),
+        "destination": str(destination),
+        "bytes": destination.stat().st_size,
+    }
+
+
 class ServiceState:
     def __init__(self, options):
         self.options = options
@@ -189,7 +228,13 @@ class ServiceState:
         data_dir = Path(os.environ.get("SOLAR_FORECAST_DATA_DIR", "/data"))
         data_dir.mkdir(parents=True, exist_ok=True)
         self.cache_path = data_dir / "met-locationforecast.json"
-        self.history = ForecastHistory(data_dir / "forecast-history.sqlite")
+        history_path = data_dir / "forecast-history.sqlite"
+        self.database_import = import_history_database_once(
+            options.get("history_database_import_path"), history_path
+        )
+        if self.database_import.get("imported"):
+            LOG.info("Preserved history database imported: %s", self.database_import)
+        self.history = ForecastHistory(history_path)
         self.config = load_site_config(options["site_config_path"])
         self._quarantine_existing_actuals()
         legacy_path = Path(str(options.get("legacy_history_path") or ""))
