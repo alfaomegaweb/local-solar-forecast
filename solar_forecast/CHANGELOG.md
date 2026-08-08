@@ -8,6 +8,9 @@
   live work limit.
 - Require site ID, decision ID, issue time and expiry time, and reject stale
   or duplicate proposals before displaying the selected input-select option.
+- Add a non-actuating Deye/ESPHome adapter concept that validates and displays
+  an ordered setpoint plan for Timezone1 SOC, voltage, power and maximum charge
+  current without publishing device addresses or Digest credentials.
 
 ## 0.5.3
 
