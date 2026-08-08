@@ -6,7 +6,7 @@ reporting, work-limit dry-run and an optional Deye/ESPHome setpoint-plan
 dry-run. Select the site's existing MQTT broker in the MQTT input node. The
 BB86 pilot listens on:
 
-`alfaomega/lsf/bb86/work_limit/proposal`
+`lsf/bb86/work_limit/proposal`
 
 The flow validates `site_id`, `decision_id`, `issued_at`/`decided_at`,
 `valid_until` and `proposed_work_limit_kw`. It rounds the proposal to a known
